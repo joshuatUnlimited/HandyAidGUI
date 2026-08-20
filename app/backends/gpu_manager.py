@@ -2,7 +2,6 @@ import os
 import re
 import subprocess
 from dataclasses import dataclass
-from pathlib import Path
 
 
 @dataclass(frozen=True)
@@ -14,39 +13,43 @@ class VulkanGPU:
 
     @property
     def total_gib(self):
-        return self.memory_total / (1024 ** 3) if self.memory_total else 0.0
+        return (
+            self.memory_total / (1024 ** 3)
+            if self.memory_total
+            else 0.0
+        )
 
     @property
     def free_gib(self):
-        return self.memory_free / (1024 ** 3) if self.memory_free else 0.0
+        return (
+            self.memory_free / (1024 ** 3)
+            if self.memory_free
+            else 0.0
+        )
 
 
 class VulkanGPUManager:
     """
-    GPU discovery and safe workload balancing for HandyAidGUI.
+    Vulkan discovery and safe workload planning for HandyAidGUI.
 
-    The current transcribe-cli API selects one compute device per process.
-    It does not expose a model tensor-split control. Therefore this manager
-    deliberately uses one process per selected Vulkan physical GPU rather than
-    inventing unsupported --tensor-split/--split-mode arguments.
+    The current transcribe-cli API does not expose tensor/model splitting.
+    A multi-GPU worker therefore loads one full model copy per process and
+    explicitly pins that process to one physical Vulkan adapter.
 
-    Each worker loads the model on exactly one Vulkan GPU. This is useful when
-    a workload can fit independently on each adapter and the goal is balanced
-    throughput. It is NOT a way to make a model larger than the smallest GPU.
+    Physical Vulkan indices and transcribe-cli --device indices are NOT the
+    same namespace when GGML_VK_VISIBLE_DEVICES is used. The caller should
+    expose one physical GPU per worker and use --device 0 in that worker.
     """
 
-    DEVICE_HEADER_RE = re.compile(
-        r"^\s*\[(?P<index>\d+)\]\s*(?P<description>.+?)\s*$",
-        re.MULTILINE,
-    )
-    MEMORY_RE = re.compile(
+    MEMORY_HEADER_RE = re.compile(
         r"memory:\s*"
         r"(?P<total>[0-9]+(?:\.[0-9]+)?)\s*GiB\s*total,\s*"
         r"(?P<free>[0-9]+(?:\.[0-9]+)?)\s*GiB\s*free",
         re.IGNORECASE,
     )
     KIND_RE = re.compile(
-        r"kind=(?P<kind>[A-Za-z0-9_+-]+)\s+type=(?P<type>[A-Za-z0-9_+-]+)",
+        r"kind=(?P<kind>[A-Za-z0-9_+-]+)\s+"
+        r"type=(?P<type>[A-Za-z0-9_+-]+)",
         re.IGNORECASE,
     )
 
@@ -55,14 +58,33 @@ class VulkanGPUManager:
         text = (value or "").strip()
         if not text:
             return ()
-        if not re.fullmatch(r"\d+(?:\s*,\s*\d+)*", text):
-            raise ValueError("Vulkan device IDs must look like 0, 1, or 0,1.")
-        return tuple(dict.fromkeys(int(part.strip()) for part in text.split(",")))
 
-    @staticmethod
-    def parse_list_devices(text: str) -> list[VulkanGPU]:
+        if not re.fullmatch(
+            r"\d+(?:\s*,\s*\d+)*",
+            text,
+        ):
+            raise ValueError(
+                "Vulkan device IDs must look like 0, 1, or 0,1."
+            )
+
+        return tuple(
+            dict.fromkeys(
+                int(part.strip())
+                for part in text.split(",")
+            )
+        )
+
+    @classmethod
+    def parse_list_devices(cls, text: str) -> list[VulkanGPU]:
+        """
+        Parse transcribe-cli --list-devices output.
+
+        The parser deliberately accepts only Vulkan GPU/IGPU entries, never
+        the CPU entry that the CLI also reports.
+        """
         lines = text.splitlines()
         devices: list[VulkanGPU] = []
+
         current_index = None
         current_description = None
         current_kind = None
@@ -71,15 +93,21 @@ class VulkanGPUManager:
         current_free = 0
 
         def flush():
-            nonlocal current_index, current_description, current_kind
-            nonlocal current_type, current_total, current_free
+            nonlocal current_index
+            nonlocal current_description
+            nonlocal current_kind
+            nonlocal current_type
+            nonlocal current_total
+            nonlocal current_free
+
             if (
                 current_index is not None
                 and current_description
                 and current_kind
                 and current_kind.lower() == "vulkan"
                 and current_type
-                and current_type.lower() in {"gpu", "igpu"}
+                and current_type.lower()
+                in {"gpu", "igpu"}
             ):
                 devices.append(
                     VulkanGPU(
@@ -89,6 +117,7 @@ class VulkanGPUManager:
                         memory_free=current_free,
                     )
                 )
+
             current_index = None
             current_description = None
             current_kind = None
@@ -98,56 +127,78 @@ class VulkanGPUManager:
 
         for raw in lines:
             line = raw.rstrip()
-            header = re.match(r"^\s*\[(\d+)\]\s*(.+?)\s*$", line)
+
+            header = re.match(
+                r"^\s*\[(\d+)\]\s*(.+?)\s*$",
+                line,
+            )
             if header:
                 flush()
                 current_index = int(header.group(1))
                 current_description = header.group(2).strip()
                 continue
 
-            kind_match = VulkanGPUManager.KIND_RE.search(line)
+            kind_match = cls.KIND_RE.search(line)
             if kind_match:
                 current_kind = kind_match.group("kind")
                 current_type = kind_match.group("type")
                 continue
 
-            memory_match = VulkanGPUManager.MEMORY_RE.search(line)
+            memory_match = cls.MEMORY_HEADER_RE.search(line)
             if memory_match:
-                current_total = int(float(memory_match.group("total")) * (1024 ** 3))
-                current_free = int(float(memory_match.group("free")) * (1024 ** 3))
+                current_total = int(
+                    float(memory_match.group("total"))
+                    * (1024 ** 3)
+                )
+                current_free = int(
+                    float(memory_match.group("free"))
+                    * (1024 ** 3)
+                )
 
         flush()
         return devices
 
     @staticmethod
-    def _query_env(base_env: dict[str, str], visible_device: int | None) -> dict[str, str]:
+    def _query_env(
+        base_env: dict[str, str],
+        visible_device: int,
+    ) -> dict[str, str]:
         env = dict(base_env)
-        if visible_device is None:
-            env.pop("GGML_VK_VISIBLE_DEVICES", None)
-        else:
-            env["GGML_VK_VISIBLE_DEVICES"] = str(visible_device)
+        env["GGML_VK_VISIBLE_DEVICES"] = str(
+            visible_device
+        )
         return env
 
     @classmethod
-    def probe(cls, binary: str, physical_ids: tuple[int, ...]) -> list[VulkanGPU]:
+    def probe(
+        cls,
+        binary: str,
+        physical_ids: tuple[int, ...],
+    ) -> list[VulkanGPU]:
         """
-        Probe each selected physical Vulkan adapter independently.
+        Probe each selected physical adapter independently.
 
-        Running --list-devices once per physical ID is intentional: the
-        transcribe runtime has a process-local compute-device registry, and its
-        --device index is not the same thing as the Vulkan physical index.
-        Restricting GGML_VK_VISIBLE_DEVICES to one adapter lets us identify the
-        adapter unambiguously without relying on registry ordering.
+        Each probe exposes exactly one Vulkan physical device, so the first
+        Vulkan device in transcribe-cli's process-local registry is guaranteed
+        to correspond to the physical adapter being probed.
         """
         if not physical_ids:
             return []
 
         found: list[VulkanGPU] = []
         base_env = os.environ.copy()
-        flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+        flags = (
+            subprocess.CREATE_NO_WINDOW
+            if os.name == "nt"
+            else 0
+        )
 
         for physical_id in physical_ids:
-            env = cls._query_env(base_env, physical_id)
+            env = cls._query_env(
+                base_env,
+                physical_id,
+            )
+
             result = subprocess.run(
                 [binary, "--list-devices"],
                 stdout=subprocess.PIPE,
@@ -159,18 +210,27 @@ class VulkanGPUManager:
                 creationflags=flags,
                 env=env,
             )
+
             text = result.stdout or ""
             devices = cls.parse_list_devices(text)
-            if result.returncode != 0 or not devices:
+
+            if result.returncode != 0:
                 raise RuntimeError(
-                    f"Could not query Vulkan GPU {physical_id}.\n\n"
-                    f"{text[-2500:]}"
+                    f"Could not query Vulkan GPU "
+                    f"{physical_id}.\n\n{text[-2500:]}"
                 )
 
-            gpu = next(
-                (item for item in devices if item.memory_total or item.memory_free),
-                devices[0],
-            )
+            if not devices:
+                raise RuntimeError(
+                    f"Vulkan GPU {physical_id} was exposed, "
+                    "but transcribe-cli reported no Vulkan GPU."
+                    f"\n\n{text[-2500:]}"
+                )
+
+            # Because only one Vulkan adapter is visible, the first Vulkan
+            # entry identifies the physical adapter we exposed.
+            gpu = devices[0]
+
             found.append(
                 VulkanGPU(
                     index=physical_id,
@@ -190,58 +250,101 @@ class VulkanGPUManager:
         fixed_reserve_bytes: int = 512 * 1024 * 1024,
     ) -> list[VulkanGPU]:
         """
-        Return GPUs that conservatively appear able to hold a full copy of the
-        model.
+        Select GPUs that conservatively appear able to hold one full model.
 
-        A worker does not share model weights with another worker, so every
-        worker must individually fit the model. Unknown memory is treated as
-        unsafe for automatic multi-GPU scheduling.
+        The check intentionally uses free VRAM, not total VRAM. A GPU with
+        insufficient free memory is excluded rather than allowed to OOM.
         """
-        if not gpus:
+        if not gpus or model_size_bytes <= 0:
             return []
 
-        required = int(model_size_bytes / max(0.01, safety_ratio)) + fixed_reserve_bytes
-        eligible = [
+        safety_ratio = max(
+            0.50,
+            min(0.90, safety_ratio),
+        )
+
+        required = int(
+            model_size_bytes / safety_ratio
+        ) + fixed_reserve_bytes
+
+        return [
             gpu
             for gpu in gpus
-            if gpu.memory_free > 0 and gpu.memory_free >= required
+            if gpu.memory_free > 0
+            and gpu.memory_free >= required
         ]
-        return eligible
 
     @staticmethod
-    def weighted_chunks(duration_s: float, gpus: list[VulkanGPU]):
+    def weighted_chunks(
+        duration_s: float,
+        gpus: list[VulkanGPU],
+    ):
         """
-        Split audio by currently available VRAM.
+        Weight audio duration by available VRAM.
 
-        Equal-capacity GPUs receive equal-duration chunks. A GPU with twice the
-        free VRAM receives roughly twice the audio. This is a capacity-oriented
-        distribution, not a claim that the adapters have equal throughput.
+        Equal-memory GPUs receive equal time. A GPU with twice the available
+        VRAM receives approximately twice the audio duration.
+
+        This is intentionally capacity-based. It is not a benchmark-derived
+        performance model.
         """
         if duration_s <= 0 or not gpus:
             return []
 
-        weights = [max(1.0, gpu.memory_free) for gpu in gpus]
-        total = sum(weights)
+        weights = [
+            max(1.0, gpu.memory_free)
+            for gpu in gpus
+        ]
+        total_weight = sum(weights)
+
         result = []
         start = 0.0
 
-        for index, (gpu, weight) in enumerate(zip(gpus, weights)):
+        for index, (gpu, weight) in enumerate(
+            zip(gpus, weights)
+        ):
             if index == len(gpus) - 1:
                 end = duration_s
             else:
-                end = start + duration_s * (weight / total)
-            result.append((gpu, start, max(0.01, end - start)))
+                end = (
+                    start
+                    + duration_s
+                    * (weight / total_weight)
+                )
+
+            result.append(
+                (
+                    gpu,
+                    start,
+                    max(
+                        0.01,
+                        end - start,
+                    ),
+                )
+            )
             start = end
 
         return result
 
     @staticmethod
-    def format_plan(gpus: list[VulkanGPU], model_size_bytes: int) -> str:
-        model_gib = model_size_bytes / (1024 ** 3)
-        lines = [f"Model file size: {model_gib:.2f} GiB"]
+    def format_plan(
+        gpus: list[VulkanGPU],
+        model_size_bytes: int,
+    ) -> str:
+        model_gib = (
+            model_size_bytes / (1024 ** 3)
+        )
+
+        lines = [
+            f"GGUF file size: {model_gib:.2f} GiB"
+        ]
+
         for gpu in gpus:
             lines.append(
-                f"GPU {gpu.index}: {gpu.description} | "
-                f"{gpu.free_gib:.2f} GiB free / {gpu.total_gib:.2f} GiB total"
+                f"GPU {gpu.index}: "
+                f"{gpu.description} | "
+                f"{gpu.free_gib:.2f} GiB free / "
+                f"{gpu.total_gib:.2f} GiB total"
             )
+
         return "\n".join(lines)
