@@ -6,7 +6,7 @@ import tkinter as tk
 from pathlib import Path
 from tkinter import ttk
 
-from app.config.settings import APP_NAME
+from app.config.settings import APP_NAME, SettingsMixin
 from app.gui.app_window import AppWindowMixin, HAVE_DND, TkinterDnD, tk as _tk
 from app.gui.theme import ThemeMixin
 from app.models.gguf import GGUFModelMixin
@@ -19,7 +19,9 @@ from app.audio.duration import AudioDurationMixin
 from app.parsing.segments import ParsingMixin
 from app.output.writers import OutputWriterMixin
 
+
 class MossTranscribeGUI(
+    SettingsMixin,
     ThemeMixin,
     AppWindowMixin,
     GGUFModelMixin,
@@ -33,78 +35,95 @@ class MossTranscribeGUI(
     OutputWriterMixin,
 ):
     def __init__(self, root):
-                self.root = root
-                self.root.title(APP_NAME)
-                self.root.geometry("1180x820")
-                self.root.minsize(820, 620)
-                self.root.configure(bg=self.BG)
-                self.root.protocol("WM_DELETE_WINDOW", self.on_close)
+        self.root = root
+        self.root.title(APP_NAME)
+        self.root.geometry("1180x820")
+        self.root.minsize(820, 620)
+        self.root.configure(bg=self.BG)
+        self.root.protocol("WM_DELETE_WINDOW", self.on_close)
 
-                self.process = None
-                self.worker = None
-                self.cancel_requested = threading.Event()
-                self.ui_queue = queue.Queue()
-                self.started_at = None
-                self.current_audio_duration = None
-                self.current_output_path = None
-                self.current_audio_path = None
-                self.last_segments = []
-                self.last_command = []
-                self.last_raw_output = ""
-                self.job_active = False
-                self.transcript_dirty = False
-                self._last_ui_update = 0.0
-                self.backend_help = ""
-                self.backend_options = set()
-                self.current_backend = ""
-                self.last_failure_details = ""
-                self.model_info = {}
-                self.compatible_model_candidates = []
+        self.process = None
+        self.processes = {}
+        self.worker = None
+        self.cancel_requested = threading.Event()
+        self.ui_queue = queue.Queue()
+        self.started_at = None
+        self.current_audio_duration = None
+        self.current_output_path = None
+        self.current_audio_path = None
+        self.last_segments = []
+        self.last_command = []
+        self.last_raw_output = ""
+        self.job_active = False
+        self.transcript_dirty = False
+        self._last_ui_update = 0.0
+        self.backend_help = ""
+        self.backend_options = set()
+        self.current_backend = ""
+        self.last_failure_details = ""
+        self.model_info = {}
+        self.compatible_model_candidates = []
 
-                cpu_count = max(1, os.cpu_count() or 4)
-                self.model_path_var = tk.StringVar()
-                self.binary_path_var = tk.StringVar(value="transcribe.exe" if os.name == "nt" else "transcribe")
-                self.audio_path_var = tk.StringVar()
-                self.output_path_var = tk.StringVar()
-                self.output_format_var = tk.StringVar(value="TXT")
-                self.threads_var = tk.IntVar(value=min(4, cpu_count))
-                self.backend_var = tk.StringVar(value="Vulkan")
-                self.vulkan_devices_var = tk.StringVar(value="0,1")
-                self.speaker_mode_var = tk.StringVar(value="multi")
-                self.language_var = tk.StringVar(value="Auto")
-                self.timestamp_var = tk.StringVar(value="Auto")
-                self.status_var = tk.StringVar(value="Ready")
-                self.elapsed_var = tk.StringVar(value="00:00")
-                self.progress_var = tk.DoubleVar(value=0)
-                self.autoscroll_var = tk.BooleanVar(value=True)
-                self.theme_var = tk.StringVar(value="dark")
+        cpu_count = max(1, os.cpu_count() or 4)
+        self.model_path_var = tk.StringVar()
+        self.binary_path_var = tk.StringVar(
+            value="transcribe.exe" if os.name == "nt" else "transcribe"
+        )
+        self.audio_path_var = tk.StringVar()
+        self.output_path_var = tk.StringVar()
+        self.output_format_var = tk.StringVar(value="TXT")
+        self.threads_var = tk.IntVar(value=min(4, cpu_count))
+        self.backend_var = tk.StringVar(value="Vulkan")
+        self.vulkan_devices_var = tk.StringVar(value="0,1")
+        self.speaker_mode_var = tk.StringVar(value="multi")
+        self.language_var = tk.StringVar(value="Auto")
+        self.timestamp_var = tk.StringVar(value="Auto")
+        self.status_var = tk.StringVar(value="Ready")
+        self.elapsed_var = tk.StringVar(value="00:00")
+        self.progress_var = tk.DoubleVar(value=0)
+        self.autoscroll_var = tk.BooleanVar(value=True)
+        self.theme_var = tk.StringVar(value="dark")
 
-                self.load_settings()
-                self.setup_styles()
-                self.build_ui()
-                self.detect_default_model()
-                self.update_output_extension()
-                if self.audio_path_var.get().strip() and Path(self.audio_path_var.get().strip()).is_file():
-                    self.current_audio_duration = None
-                    threading.Thread(target=self.probe_duration_async, args=(self.audio_path_var.get().strip(),), daemon=True).start()
-                self.poll_ui_queue()
-                self.update_elapsed()
-                self.update_capabilities()
-                self.update_backend_ui()
+        self.load_settings()
+        self.setup_styles()
+        self.build_ui()
+        self.detect_default_model()
+        self.update_output_extension()
+
+        if (
+            self.audio_path_var.get().strip()
+            and Path(self.audio_path_var.get().strip()).is_file()
+        ):
+            self.current_audio_duration = None
+            threading.Thread(
+                target=self.probe_duration_async,
+                args=(self.audio_path_var.get().strip(),),
+                daemon=True,
+            ).start()
+
+        self.poll_ui_queue()
+        self.update_elapsed()
+        self.update_capabilities()
+        self.update_backend_ui()
+
 
 def main():
     if HAVE_DND:
         class SafeTkinterDnD(TkinterDnD.Tk):
             def readprofile(self, _base_name, _class_name):
                 return
+
         root = SafeTkinterDnD()
     else:
         class SafeTk(tk.Tk):
             def readprofile(self, _base_name, _class_name):
                 return
+
         root = SafeTk()
+
     MossTranscribeGUI(root)
     root.mainloop()
+
 
 if __name__ == "__main__":
     main()
