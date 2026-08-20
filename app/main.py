@@ -6,8 +6,16 @@ import tkinter as tk
 from pathlib import Path
 from tkinter import ttk
 
-from app.config.settings import APP_NAME, SettingsMixin
-from app.gui.app_window import AppWindowMixin, HAVE_DND, TkinterDnD, tk as _tk
+from app.config.settings import APP_NAME, APP_SUBTITLE, SettingsMixin
+
+# app_window.py currently references APP_NAME and APP_SUBTITLE without
+# importing them itself. Inject the values into that module before the GUI
+# class is constructed, so the existing module remains compatible.
+from app.gui import app_window as _app_window
+_app_window.APP_NAME = APP_NAME
+_app_window.APP_SUBTITLE = APP_SUBTITLE
+
+from app.gui.app_window import AppWindowMixin, HAVE_DND, TkinterDnD
 from app.gui.theme import ThemeMixin
 from app.models.gguf import GGUFModelMixin
 from app.models.compatibility import ModelCompatibilityMixin
@@ -65,6 +73,7 @@ class MossTranscribeGUI(
         self.compatible_model_candidates = []
 
         cpu_count = max(1, os.cpu_count() or 4)
+
         self.model_path_var = tk.StringVar()
         self.binary_path_var = tk.StringVar(
             value="transcribe.exe" if os.name == "nt" else "transcribe"
