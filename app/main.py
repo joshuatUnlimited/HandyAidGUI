@@ -27,6 +27,9 @@ from app.audio.duration import AudioDurationMixin
 from app.parsing.segments import ParsingMixin
 from app.output.writers import OutputWriterMixin
 
+# ======================== NEW IMPORT ========================
+from app.gui.gpu_panel import GPUControlPanelMixin
+
 
 class MossTranscribeGUI(
     SettingsMixin,
@@ -41,6 +44,7 @@ class MossTranscribeGUI(
     AudioDurationMixin,
     ParsingMixin,
     OutputWriterMixin,
+    GPUControlPanelMixin,          # <-- ADDED
 ):
     def __init__(self, root):
         self.root = root
@@ -95,9 +99,15 @@ class MossTranscribeGUI(
 
         self.load_settings()
         self.setup_styles()
-        self.build_ui()
+        self.build_ui()  # ← creates the notebook (self.notebook) via AppWindowMixin
         self.detect_default_model()
         self.update_output_extension()
+
+        # ======================== NEW: ADD GPU TAB ========================
+        if hasattr(self, 'notebook'):
+            self.gpu_tab = self.build_gpu_tab(self.notebook)
+            self.notebook.add(self.gpu_tab, text="GPU")
+        # ================================================================
 
         if (
             self.audio_path_var.get().strip()
