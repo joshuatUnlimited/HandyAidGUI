@@ -103,11 +103,11 @@ class MossTranscribeGUI(
         self.detect_default_model()
         self.update_output_extension()
 
-        # ======================== NEW: ADD GPU TAB ========================
+        # ======================== ADD GPU TAB ========================
         if hasattr(self, 'notebook'):
             self.gpu_tab = self.build_gpu_tab(self.notebook)
             self.notebook.add(self.gpu_tab, text="GPU")
-        # ================================================================
+        # =============================================================
 
         if (
             self.audio_path_var.get().strip()
@@ -124,6 +124,20 @@ class MossTranscribeGUI(
         self.update_elapsed()
         self.update_capabilities()
         self.update_backend_ui()
+
+    # ================== DELEGATE TKINTER METHODS TO self.root ==================
+    def after(self, ms, func):
+        """Delegate to the root Tk instance."""
+        return self.root.after(ms, func)
+
+    def after_cancel(self, id):
+        """Cancel a previously scheduled after callback."""
+        self.root.after_cancel(id)
+
+    def update_idletasks(self):
+        """Delegate to the root Tk instance."""
+        self.root.update_idletasks()
+    # ===========================================================================
 
 
 def main():
