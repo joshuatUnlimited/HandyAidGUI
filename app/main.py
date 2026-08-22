@@ -30,13 +30,13 @@ from app.gui.gpu_panel import GPUControlPanelMixin
 
 
 # ================================================================
-# Robust stub that catches any method call and returns empty data
+# Robust stub that accepts any method call with any arguments
 # ================================================================
 class StubGPUManager:
-    def scan(self):
+    def scan(self, *args, **kwargs):
         return []
 
-    def enumerate_all(self):
+    def enumerate_all(self, *args, **kwargs):
         return []
 
     def __getattr__(self, name):
