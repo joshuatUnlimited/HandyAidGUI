@@ -1,6 +1,7 @@
 # app/gui/moss_tab.py
 
 import os
+import re
 import subprocess
 import threading
 import tempfile
@@ -21,7 +22,7 @@ class MossTab:
 
     def __init__(self, parent, app_window):
         self.parent = parent
-        self.app = app_window          # reference to main window (for settings)
+        self.app = app_window
         self.file_path = None
         self.is_processing = False
         self._cancel = False
@@ -29,7 +30,6 @@ class MossTab:
 
     # ---------- UI ----------
     def build_ui(self):
-        # File selection
         file_frame = ttk.LabelFrame(self.parent, text="Audio File", padding=10)
         file_frame.pack(fill="x", pady=(0, 12))
         self.file_var = tk.StringVar(value="No file selected")
@@ -38,7 +38,6 @@ class MossTab:
         )
         ttk.Button(file_frame, text="Browse...", command=self.browse_file).pack(side="right")
 
-        # Chunking parameters
         chunk_frame = ttk.LabelFrame(self.parent, text="Chunking Parameters", padding=10)
         chunk_frame.pack(fill="x", pady=(0, 12))
         duration_row = ttk.Frame(chunk_frame)
@@ -55,7 +54,6 @@ class MossTab:
         ttk.Radiobutton(policy_row, text="Keep", variable=self.truncate_policy, value="keep").pack(side="left")
         ttk.Radiobutton(policy_row, text="Drop", variable=self.truncate_policy, value="drop").pack(side="left", padx=(10, 0))
 
-        # Buttons
         btn_frame = ttk.Frame(self.parent)
         btn_frame.pack(fill="x", pady=8)
         self.process_btn = ttk.Button(btn_frame, text="Start Transcription", command=self.start_processing, style="Accent.TButton")
@@ -63,11 +61,9 @@ class MossTab:
         self.stop_btn = ttk.Button(btn_frame, text="Stop", command=self.stop_processing, state="disabled", style="Danger.TButton")
         self.stop_btn.pack(side="left")
 
-        # Progress
         self.progress = ttk.Progressbar(self.parent, mode="determinate")
         self.progress.pack(fill="x", pady=6)
 
-        # Log
         log_frame = ttk.LabelFrame(self.parent, text="Processing Log", padding=8)
         log_frame.pack(fill="both", expand=True, pady=(8, 0))
         self.log_text = tk.Text(log_frame, height=12, wrap="word", state="disabled")
@@ -100,7 +96,6 @@ class MossTab:
         if self.is_processing:
             return
 
-        # Validate binary and model from main app
         binary = self.app.binary_path_var.get().strip()
         model = self.app.model_path_var.get().strip()
         if not binary or not Path(binary).is_file():
@@ -182,7 +177,6 @@ class MossTab:
                 seg["start"] += offset
                 seg["end"] += offset
 
-            # Remap speaker labels locally -> global
             for seg in result:
                 local_id = seg.get("speaker", "S01")
                 if local_id not in speaker_map:
@@ -250,30 +244,40 @@ class MossTab:
             model = self.app.model_path_var.get().strip()
             backend = self.app.backend_var.get().lower()   # 'vulkan', 'auto', or 'cpu'
             threads = self.app.resolved_threads()
-            language = self.app.language_var.get().strip()
-            if language.lower() == "auto":
-                language = "auto"
 
-            # Base command
-            cmd = [
-                binary,
-                "--model", model,
-                "--file", tmp_path,
-                "--backend", backend,
-                "--threads", str(threads),
-                "--language", language,
-            ]
+            # Language: extract ISO code from "English (en)" or use raw string if just "en"
+            raw_lang = self.app.language_var.get().strip()
+            lang_code = raw_lang
+            # Try to extract code inside parentheses, e.g., "English (en)" -> "en"
+            match = re.search(r'\((\w+)\)', raw_lang)
+            if match:
+                lang_code = match.group(1)
+            elif raw_lang.lower() == "auto":
+                lang_code = "auto"
+            # else keep as is (may be "en" or "de" etc.)
 
-            # Add timestamps if requested
+            # Timestamps: map GUI values to binary values
             ts_setting = self.app.timestamp_var.get()
             if ts_setting == "Segment":
-                cmd.append("--timestamps")
+                ts_value = "segment"
             elif ts_setting == "None":
-                cmd.append("--no-timestamps")
+                ts_value = "none"
+            else:  # "Auto"
+                ts_value = "auto"
 
-            # Try to request JSON output – if your binary doesn't support it, remove or comment this line.
-            # If your binary does support it, uncomment:
-            # cmd.append("--output-json")
+            # Build command
+            # The binary expects: transcribe-cli [options] audio.wav
+            # Options: -m model, --backend, --threads, -l language, --timestamps, --diarize, etc.
+            cmd = [
+                binary,
+                "-m", model,
+                "--backend", backend,
+                "--threads", str(threads),
+                "-l", lang_code,
+                "--timestamps", ts_value,
+                "--diarize",          # enable speaker diarization for MOSS
+                tmp_path              # positional argument: input audio file
+            ]
 
             self.parent.after(0, lambda: self.log(f"Running: {' '.join(cmd)}"))
             proc = subprocess.Popen(
@@ -296,10 +300,11 @@ class MossTab:
                 self.parent.after(0, lambda: self.log(f"Transcription failed with code {proc.returncode}"))
                 return self._fallback_segment(audio, sr, text=f"Error: {stderr}")
 
-            # Try to parse as JSON (if you uncommented --output-json)
-            segments = self._parse_json_output(stdout)
-            if segments:
-                return segments
+            # Try to parse as JSON if stdout starts with '{' or '[' (maybe the binary outputs JSON)
+            if stdout.strip().startswith(('{', '[')):
+                segments = self._parse_json_output(stdout)
+                if segments:
+                    return segments
 
             # Fallback: treat entire stdout as one segment
             if stdout.strip():
@@ -329,10 +334,23 @@ class MossTab:
         """Parse the transcribe.exe JSON output into list of segments."""
         try:
             data = json.loads(text)
-            if "segments" in data:
-                segments = data["segments"]
-            else:
+            # Assume either a dict with "segments" or a list directly
+            if isinstance(data, dict):
+                if "segments" in data:
+                    segments = data["segments"]
+                else:
+                    # maybe the whole dict is a segment?
+                    return [{
+                        "start": data.get("start", 0.0),
+                        "end": data.get("end", 0.0),
+                        "speaker": data.get("speaker", "S01"),
+                        "text": data.get("text", "").strip(),
+                    }] if "text" in data else None
+            elif isinstance(data, list):
                 segments = data
+            else:
+                return None
+
             result = []
             for seg in segments:
                 if isinstance(seg, dict):
