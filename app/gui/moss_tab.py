@@ -5,11 +5,14 @@ import subprocess
 import threading
 import tempfile
 import json
+import wave
 import tkinter as tk
 from pathlib import Path
 from tkinter import ttk, filedialog, messagebox
+
 import numpy as np
 import torch
+
 from app.config.settings import SUPPORTED_AUDIO
 
 
@@ -18,14 +21,15 @@ class MossTab:
 
     def __init__(self, parent, app_window):
         self.parent = parent
-        self.app = app_window          # main window – access to settings
+        self.app = app_window          # reference to main window (for settings)
         self.file_path = None
         self.is_processing = False
         self._cancel = False
         self.build_ui()
 
+    # ---------- UI ----------
     def build_ui(self):
-        # ... (UI is identical to before – keep as is) ...
+        # File selection
         file_frame = ttk.LabelFrame(self.parent, text="Audio File", padding=10)
         file_frame.pack(fill="x", pady=(0, 12))
         self.file_var = tk.StringVar(value="No file selected")
@@ -34,6 +38,7 @@ class MossTab:
         )
         ttk.Button(file_frame, text="Browse...", command=self.browse_file).pack(side="right")
 
+        # Chunking parameters
         chunk_frame = ttk.LabelFrame(self.parent, text="Chunking Parameters", padding=10)
         chunk_frame.pack(fill="x", pady=(0, 12))
         duration_row = ttk.Frame(chunk_frame)
@@ -50,6 +55,7 @@ class MossTab:
         ttk.Radiobutton(policy_row, text="Keep", variable=self.truncate_policy, value="keep").pack(side="left")
         ttk.Radiobutton(policy_row, text="Drop", variable=self.truncate_policy, value="drop").pack(side="left", padx=(10, 0))
 
+        # Buttons
         btn_frame = ttk.Frame(self.parent)
         btn_frame.pack(fill="x", pady=8)
         self.process_btn = ttk.Button(btn_frame, text="Start Transcription", command=self.start_processing, style="Accent.TButton")
@@ -57,9 +63,11 @@ class MossTab:
         self.stop_btn = ttk.Button(btn_frame, text="Stop", command=self.stop_processing, state="disabled", style="Danger.TButton")
         self.stop_btn.pack(side="left")
 
+        # Progress
         self.progress = ttk.Progressbar(self.parent, mode="determinate")
         self.progress.pack(fill="x", pady=6)
 
+        # Log
         log_frame = ttk.LabelFrame(self.parent, text="Processing Log", padding=8)
         log_frame.pack(fill="both", expand=True, pady=(8, 0))
         self.log_text = tk.Text(log_frame, height=12, wrap="word", state="disabled")
@@ -84,6 +92,7 @@ class MossTab:
         self.log_text.see("end")
         self.log_text.configure(state="disabled")
 
+    # ---------- Control ----------
     def start_processing(self):
         if not self.file_path or not os.path.exists(self.file_path):
             messagebox.showerror("Error", "Please select a valid audio file first.")
@@ -91,7 +100,7 @@ class MossTab:
         if self.is_processing:
             return
 
-        # Validate binary and model
+        # Validate binary and model from main app
         binary = self.app.binary_path_var.get().strip()
         model = self.app.model_path_var.get().strip()
         if not binary or not Path(binary).is_file():
@@ -120,6 +129,7 @@ class MossTab:
         self.log("⏹ Stopping... (will exit after current chunk)")
         self._cancel = True
 
+    # ---------- Pipeline ----------
     def _process(self):
         try:
             self._cancel = False
@@ -172,6 +182,7 @@ class MossTab:
                 seg["start"] += offset
                 seg["end"] += offset
 
+            # Remap speaker labels locally -> global
             for seg in result:
                 local_id = seg.get("speaker", "S01")
                 if local_id not in speaker_map:
@@ -192,6 +203,7 @@ class MossTab:
         transcript = self._format_transcript(all_segments)
         return transcript
 
+    # ---------- Audio loading (ffmpeg) ----------
     def _load_audio_ffmpeg(self, filepath, target_sr=16000):
         """Load audio file using ffmpeg, return (numpy array, sample_rate)."""
         cmd = [
@@ -215,6 +227,7 @@ class MossTab:
             self.parent.after(0, lambda: self.log(f"ffmpeg error: {str(e)}"))
             return None, target_sr
 
+    # ---------- Transcribe a single chunk ----------
     def _transcribe_chunk(self, audio, sr):
         """
         Transcribe one audio chunk using the selected transcribe.exe.
@@ -224,42 +237,44 @@ class MossTab:
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
             tmp_path = tmp.name
         try:
-            # Write 16-bit PCM WAV using the wave module (stdlib)
-            import wave
+            # Write 16-bit PCM WAV
             with wave.open(tmp_path, "wb") as wf:
                 wf.setnchannels(1)
-                wf.setsampwidth(2)          # 16-bit
+                wf.setsampwidth(2)
                 wf.setframerate(sr)
-                # Convert float [-1,1] to int16
                 int_audio = (audio * 32767).astype(np.int16).tobytes()
                 wf.writeframes(int_audio)
 
-            # Build command line arguments (mirroring the main engine)
+            # Build command from main app settings
             binary = self.app.binary_path_var.get().strip()
             model = self.app.model_path_var.get().strip()
-            backend = self.app.backend_var.get()
+            backend = self.app.backend_var.get().lower()   # 'vulkan', 'auto', or 'cpu'
             threads = self.app.resolved_threads()
             language = self.app.language_var.get().strip()
             if language.lower() == "auto":
                 language = "auto"
 
+            # Base command
             cmd = [
                 binary,
                 "--model", model,
                 "--file", tmp_path,
-                "--backend", backend.lower(),
+                "--backend", backend,
                 "--threads", str(threads),
                 "--language", language,
-                "--output-json",      # request JSON output for structured parsing
             ]
 
-            # Optional: add timestamps flag
-            if self.app.timestamp_var.get() == "Segment":
+            # Add timestamps if requested
+            ts_setting = self.app.timestamp_var.get()
+            if ts_setting == "Segment":
                 cmd.append("--timestamps")
-            elif self.app.timestamp_var.get() == "None":
+            elif ts_setting == "None":
                 cmd.append("--no-timestamps")
 
-            # Run the binary
+            # Try to request JSON output – if your binary doesn't support it, remove or comment this line.
+            # If your binary does support it, uncomment:
+            # cmd.append("--output-json")
+
             self.parent.after(0, lambda: self.log(f"Running: {' '.join(cmd)}"))
             proc = subprocess.Popen(
                 cmd,
@@ -270,27 +285,41 @@ class MossTab:
                 errors="replace"
             )
             stdout, stderr = proc.communicate(timeout=300)   # 5 min per chunk
+
+            if stdout:
+                snippet = stdout[:500] + ("..." if len(stdout) > 500 else "")
+                self.parent.after(0, lambda: self.log(f"STDOUT (first 500):\n{snippet}"))
+            if stderr:
+                self.parent.after(0, lambda: self.log(f"STDERR:\n{stderr}"))
+
             if proc.returncode != 0:
                 self.parent.after(0, lambda: self.log(f"Transcription failed with code {proc.returncode}"))
-                self.parent.after(0, lambda: self.log(f"stderr: {stderr}"))
-                return self._fallback_segment(audio, sr)
+                return self._fallback_segment(audio, sr, text=f"Error: {stderr}")
 
-            # Parse JSON output
+            # Try to parse as JSON (if you uncommented --output-json)
             segments = self._parse_json_output(stdout)
-            if segments is None:
-                # Fallback: treat entire stdout as raw text
-                return self._fallback_segment(audio, sr, text=stdout.strip())
+            if segments:
+                return segments
 
-            return segments
+            # Fallback: treat entire stdout as one segment
+            if stdout.strip():
+                return [{
+                    "start": 0.0,
+                    "end": len(audio) / sr,
+                    "speaker": "S01",
+                    "text": stdout.strip()
+                }]
+            else:
+                self.parent.after(0, lambda: self.log("No output from transcribe."))
+                return self._fallback_segment(audio, sr, text="(Empty output)")
 
         except subprocess.TimeoutExpired:
             self.parent.after(0, lambda: self.log("Transcription timed out for this chunk."))
-            return self._fallback_segment(audio, sr)
+            return self._fallback_segment(audio, sr, text="(Timeout)")
         except Exception as e:
             self.parent.after(0, lambda: self.log(f"Error in _transcribe_chunk: {str(e)}"))
-            return self._fallback_segment(audio, sr)
+            return self._fallback_segment(audio, sr, text=f"(Error: {e})")
         finally:
-            # Clean up temporary file
             try:
                 os.unlink(tmp_path)
             except OSError:
@@ -306,7 +335,6 @@ class MossTab:
                 segments = data
             result = []
             for seg in segments:
-                # Expected keys: start, end, speaker, text
                 if isinstance(seg, dict):
                     result.append({
                         "start": seg.get("start", 0.0),
@@ -328,6 +356,7 @@ class MossTab:
             "text": text or f"[Placeholder] This chunk is {duration:.1f}s long"
         }]
 
+    # ---------- Formatting and output ----------
     def _format_transcript(self, segments):
         lines = []
         for seg in segments:
