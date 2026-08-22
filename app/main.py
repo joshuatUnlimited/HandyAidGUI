@@ -8,9 +8,7 @@ from tkinter import ttk
 
 from app.config.settings import APP_NAME, APP_SUBTITLE, SettingsMixin
 
-# app_window.py currently references APP_NAME and APP_SUBTITLE without
-# importing them itself. Inject the values into that module before the GUI
-# class is constructed, so the existing module remains compatible.
+# Inject values into app_window module
 from app.gui import app_window as _app_window
 _app_window.APP_NAME = APP_NAME
 _app_window.APP_SUBTITLE = APP_SUBTITLE
@@ -27,8 +25,15 @@ from app.audio.duration import AudioDurationMixin
 from app.parsing.segments import ParsingMixin
 from app.output.writers import OutputWriterMixin
 
-# ======================== NEW IMPORT ========================
+# ====================== GPU PANEL IMPORT ======================
 from app.gui.gpu_panel import GPUControlPanelMixin
+
+# ====================== STUB GPU MANAGER ======================
+class StubGPUManager:
+    """Minimal GPU manager that prevents errors until real detection is wired."""
+    def scan(self):
+        # Return an empty list – the UI will show "No GPUs detected"
+        return []
 
 
 class MossTranscribeGUI(
@@ -99,15 +104,21 @@ class MossTranscribeGUI(
 
         self.load_settings()
         self.setup_styles()
-        self.build_ui()  # ← creates the notebook (self.notebook) via AppWindowMixin
+        self.build_ui()  # creates notebook (self.notebook)
         self.detect_default_model()
         self.update_output_extension()
 
-        # ======================== ADD GPU TAB ========================
+        # ========== INITIALISE GPU-RELATED ATTRIBUTES ==========
+        # The GPU mixin needs these two to avoid the "not configured" error.
+        self.transcribe_binary = self.binary_path_var.get()
+        self.gpu_manager = StubGPUManager()
+        # ========================================================
+
+        # ========== ADD GPU TAB ==========
         if hasattr(self, 'notebook'):
             self.gpu_tab = self.build_gpu_tab(self.notebook)
             self.notebook.add(self.gpu_tab, text="GPU")
-        # =============================================================
+        # =================================
 
         if (
             self.audio_path_var.get().strip()
@@ -125,19 +136,16 @@ class MossTranscribeGUI(
         self.update_capabilities()
         self.update_backend_ui()
 
-    # ================== DELEGATE TKINTER METHODS TO self.root ==================
+    # ========== DELEGATE TKINTER METHODS TO self.root ==========
     def after(self, ms, func):
-        """Delegate to the root Tk instance."""
         return self.root.after(ms, func)
 
     def after_cancel(self, id):
-        """Cancel a previously scheduled after callback."""
         self.root.after_cancel(id)
 
     def update_idletasks(self):
-        """Delegate to the root Tk instance."""
         self.root.update_idletasks()
-    # ===========================================================================
+    # ===========================================================
 
 
 def main():
