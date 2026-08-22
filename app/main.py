@@ -1,8 +1,5 @@
 import os
 import queue
-import re
-import json
-import subprocess
 import threading
 import time
 import tkinter as tk
@@ -21,6 +18,7 @@ from app.gui.theme import ThemeMixin
 from app.models.gguf import GGUFModelMixin
 from app.models.compatibility import ModelCompatibilityMixin
 from app.backends.vulkan import VulkanBackendMixin
+from app.backends.gpu_manager import VulkanGPUManager, VulkanGPU
 from app.engine.command_builder import CommandBuilderMixin
 from app.engine.transcriber import TranscriptionEngineMixin
 from app.audio.converter import AudioConverterMixin
@@ -33,220 +31,93 @@ from app.gui.gpu_panel import GPUControlPanelMixin
 
 
 # ======================================================================
-# REAL GPU MANAGER – detects Vulkan devices using transcribe + vulkaninfo
+# PROPER GPU MANAGER – uses the official --list-devices flag
 # ======================================================================
-class RealGPUManager:
+class GPUManager:
+    """
+    Wraps VulkanGPUManager to provide the interface GPUControlPanelMixin expects.
+    """
     def __init__(self, binary_path):
         self.binary_path = binary_path
-        self._devices = []
         self._last_error = None
-        self._debug_logs = []   # store recent debug output
 
-    def _run_command(self, cmd, timeout=10):
-        """Run a command and return (stdout, stderr, returncode)."""
+    def enumerate_all(self, binary: str) -> list:
+        """
+        Enumerate all Vulkan-capable GPUs using transcribe-cli --list-devices.
+        Returns a list of GPUInfo objects (dataclass expected by GPUControlPanelMixin).
+        """
         try:
+            # Run transcribe --list-devices
+            import subprocess
             result = subprocess.run(
-                cmd,
-                capture_output=True,
+                [binary, "--list-devices"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
                 text=True,
-                timeout=timeout,
-                check=False
+                encoding="utf-8",
+                errors="replace",
+                timeout=15,
+                creationflags=(subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0),
             )
-            return result.stdout, result.stderr, result.returncode
+            text = result.stdout or ""
+
+            if result.returncode != 0:
+                self._last_error = f"transcribe --list-devices failed: {text[:500]}"
+                return []
+
+            # Parse using the official parser
+            vulkan_gpus = VulkanGPUManager.parse_list_devices(text)
+
+            if not vulkan_gpus:
+                self._last_error = "No Vulkan-capable GPUs found."
+                return []
+
+            # Convert VulkanGPU to GPUInfo (the dataclass GPUControlPanelMixin expects)
+            # GPUInfo is defined in gpu_panel.py: index, name, vram_total, vram_free
+            from app.gui.gpu_panel import GPUInfo
+            return [
+                GPUInfo(
+                    index=gpu.index,
+                    name=gpu.description,
+                    vram_total=gpu.memory_total,
+                    vram_free=gpu.memory_free,
+                )
+                for gpu in vulkan_gpus
+            ]
+
         except subprocess.TimeoutExpired:
-            return "", f"Command timed out after {timeout}s", -1
+            self._last_error = "transcribe --list-devices timed out."
+            return []
         except FileNotFoundError:
-            return "", f"Command not found: {cmd[0]}", -1
+            self._last_error = f"Binary not found: {binary}"
+            return []
         except Exception as e:
-            return "", str(e), -1
+            self._last_error = f"Error enumerating GPUs: {e}"
+            return []
 
-    def _try_flags(self, flags):
-        """Try a list of flags on transcribe binary. Return (output, flag_used)."""
-        for flag in flags:
-            stdout, stderr, rc = self._run_command([self.binary_path, flag])
-            combined = stdout + "\n" + stderr
-            if rc == 0 and combined.strip():
-                self._debug_logs.append(f"Flag {flag} returned output (len={len(combined)})")
-                return combined, flag
-            else:
-                self._debug_logs.append(f"Flag {flag} failed (rc={rc})")
-        return None, None
-
-    def _parse_json_devices(self, output):
-        """Parse JSON output; expects list or dict with devices/gpus."""
+    def probe(self, binary: str, index: int):
+        """
+        Probe a specific GPU by index. Used for live VRAM refresh.
+        """
         try:
-            data = json.loads(output)
-            if isinstance(data, list):
-                return data
-            if isinstance(data, dict):
-                for key in ('devices', 'gpus', 'vulkan_devices', 'gpu_devices'):
-                    if key in data and isinstance(data[key], list):
-                        return data[key]
-        except json.JSONDecodeError:
+            # Use VulkanGPUManager.probe to get fresh data for one GPU
+            gpus = VulkanGPUManager.probe(binary, (index,))
+            if gpus:
+                gpu = gpus[0]
+                from app.gui.gpu_panel import GPUInfo
+                return GPUInfo(
+                    index=gpu.index,
+                    name=gpu.description,
+                    vram_total=gpu.memory_total,
+                    vram_free=gpu.memory_free,
+                )
+        except Exception:
             pass
-        return None
-
-    def _parse_text_devices(self, output):
-        """
-        Parse common text formats:
-          - "GPU 0: NVIDIA GeForce RTX 3080 (10240 MB)"
-          - "Device 0: ... Memory: 8192 MB"
-          - "Name: ... Memory: ..."
-        Also handles Vulkaninfo format:
-          "GPU id : 0 (NVIDIA GeForce RTX 3080)"
-          "Dedicated video memory: 10240 MB"
-        """
-        devices = []
-        lines = output.splitlines()
-        patterns = [
-            r'(?:GPU|Device)\s*(\d+)\s*:\s*([^,\(]+)(?:\s*\((\d+)\s*MB\))?',
-            r'Name:\s*([^\n]+)\s*Memory:\s*(\d+)\s*MB',
-            r'GPU id\s*:\s*(\d+)\s*\(([^)]+)\)',
-            r'Device\s*(\d+)\s*:\s*([^,]+),\s*VRAM:\s*(\d+)\s*MB',
-        ]
-        for pattern in patterns:
-            for match in re.finditer(pattern, output, re.IGNORECASE):
-                groups = match.groups()
-                if len(groups) == 3:
-                    idx, name, mem = groups
-                    devices.append({
-                        'index': int(idx),
-                        'name': name.strip(),
-                        'total_memory_mb': int(mem) if mem else 0,
-                        'free_memory_mb': int(mem) if mem else 0,
-                        'used_memory_mb': 0,
-                    })
-                elif len(groups) == 2:
-                    if groups[1].isdigit():
-                        name, mem = groups
-                        idx = len(devices)
-                        devices.append({
-                            'index': idx,
-                            'name': name.strip(),
-                            'total_memory_mb': int(mem),
-                            'free_memory_mb': int(mem),
-                            'used_memory_mb': 0,
-                        })
-                    else:
-                        # index and name, memory will be filled later if found
-                        idx, name = groups
-                        devices.append({
-                            'index': int(idx),
-                            'name': name.strip(),
-                            'total_memory_mb': 0,
-                            'free_memory_mb': 0,
-                            'used_memory_mb': 0,
-                        })
-        # If we have devices with index but no memory, try to find memory lines
-        mem_lines = re.findall(r'Dedicated video memory:\s*(\d+)\s*MB', output, re.IGNORECASE)
-        for i, mem in enumerate(mem_lines):
-            if i < len(devices):
-                devices[i]['total_memory_mb'] = int(mem)
-                devices[i]['free_memory_mb'] = int(mem)
-        return devices
-
-    def _vulkaninfo_fallback(self):
-        """Try to use vulkaninfo to get devices."""
-        stdout, stderr, rc = self._run_command(['vulkaninfo', '--summary'], timeout=15)
-        if rc != 0:
-            return []
-        devices = []
-        # Look for lines like "GPU id : 0 (NVIDIA GeForce RTX 3080)"
-        for line in stdout.splitlines():
-            match = re.search(r'GPU id\s*:\s*(\d+)\s*\(([^)]+)\)', line)
-            if match:
-                idx = int(match.group(1))
-                name = match.group(2).strip()
-                devices.append({
-                    'index': idx,
-                    'name': name,
-                    'total_memory_mb': 0,
-                    'free_memory_mb': 0,
-                    'used_memory_mb': 0,
-                })
-        # Now find memory lines and assign them in order of device index
-        mem_lines = re.findall(r'Dedicated video memory:\s*(\d+)\s*MB', stdout, re.IGNORECASE)
-        for i, mem in enumerate(mem_lines):
-            if i < len(devices):
-                devices[i]['total_memory_mb'] = int(mem)
-                devices[i]['free_memory_mb'] = int(mem)
-        # If no memory found, try "Device memory: X MB"
-        if not mem_lines:
-            mem_lines = re.findall(r'Device memory:\s*(\d+)\s*MB', stdout, re.IGNORECASE)
-            for i, mem in enumerate(mem_lines):
-                if i < len(devices):
-                    devices[i]['total_memory_mb'] = int(mem)
-                    devices[i]['free_memory_mb'] = int(mem)
-        return devices
-
-    def scan(self):
-        """Return list of GPU devices."""
-        if not os.path.exists(self.binary_path):
-            self._last_error = f"Transcribe binary not found at: {self.binary_path}"
-            self._devices = []
-            return []
-
-        flags_to_try = [
-            "--list-vulkan",
-            "--list-gpu",
-            "--gpu-devices",
-            "--show-gpu",
-            "--list-devices",
-            "--gpu-list",
-            "--vulkan-devices",
-            "--print-devices",
-            "--help"
-        ]
-        output, used_flag = self._try_flags(flags_to_try)
-
-        devices = []
-        if output:
-            parsed = self._parse_json_devices(output)
-            if parsed:
-                devices = parsed
-            else:
-                devices = self._parse_text_devices(output)
-
-        if devices:
-            self._devices = devices
-            self._last_error = None
-            return devices
-
-        # Fallback to vulkaninfo
-        self._debug_logs.append("Transcribe flags failed, trying vulkaninfo fallback")
-        devices = self._vulkaninfo_fallback()
-        if devices:
-            self._devices = devices
-            self._last_error = None
-            return devices
-
-        self._last_error = "No Vulkan-capable GPUs found. Tried transcribe flags and vulkaninfo."
-        self._devices = []
-        return []
-
-    def enumerate_all(self, extra_arg=None):
-        return self.scan()
-
-    def get_usage(self, device_index):
-        return None
-
-    def get_memory_info(self, device_index):
-        for dev in self._devices:
-            if dev.get('index') == device_index:
-                return {
-                    'total': dev.get('total_memory_mb', 0),
-                    'free': dev.get('free_memory_mb', 0),
-                    'used': dev.get('used_memory_mb', 0),
-                }
         return None
 
     @property
     def last_error(self):
         return self._last_error
-
-    def get_debug_logs(self):
-        return self._debug_logs
-# ======================================================================
 
 
 class MossTranscribeGUI(
@@ -323,7 +194,7 @@ class MossTranscribeGUI(
 
         # ========== INITIALISE GPU-RELATED ATTRIBUTES ==========
         self.transcribe_binary = self.binary_path_var.get()
-        self.gpu_manager = RealGPUManager(self.transcribe_binary)
+        self.gpu_manager = GPUManager(self.transcribe_binary)
         # ========================================================
 
         # ========== ADD GPU TAB ==========
