@@ -3,7 +3,10 @@
 import os
 import subprocess
 import threading
+import tempfile
+import json
 import tkinter as tk
+from pathlib import Path
 from tkinter import ttk, filedialog, messagebox
 import numpy as np
 import torch
@@ -11,81 +14,57 @@ from app.config.settings import SUPPORTED_AUDIO
 
 
 class MossTab:
-    """MOSS audio chunking and transcription tab (no librosa)."""
+    """MOSS audio chunking and transcription tab (uses transcribe.exe)."""
 
     def __init__(self, parent, app_window):
         self.parent = parent
-        self.app = app_window
+        self.app = app_window          # main window – access to settings
         self.file_path = None
-        self.model = None
         self.is_processing = False
         self._cancel = False
         self.build_ui()
 
     def build_ui(self):
-        # File selection
+        # ... (UI is identical to before – keep as is) ...
         file_frame = ttk.LabelFrame(self.parent, text="Audio File", padding=10)
         file_frame.pack(fill="x", pady=(0, 12))
-
         self.file_var = tk.StringVar(value="No file selected")
         ttk.Entry(file_frame, textvariable=self.file_var, state="readonly").pack(
             side="left", fill="x", expand=True, padx=(0, 8)
         )
         ttk.Button(file_frame, text="Browse...", command=self.browse_file).pack(side="right")
 
-        # Chunking parameters
         chunk_frame = ttk.LabelFrame(self.parent, text="Chunking Parameters", padding=10)
         chunk_frame.pack(fill="x", pady=(0, 12))
-
-        # Chunk duration
         duration_row = ttk.Frame(chunk_frame)
         duration_row.pack(fill="x", pady=2)
         ttk.Label(duration_row, text="Chunk duration (seconds):").pack(side="left", padx=(0, 10))
         self.chunk_duration = tk.IntVar(value=60)
-        ttk.Spinbox(
-            duration_row, from_=10, to=600, textvariable=self.chunk_duration,
-            width=8
-        ).pack(side="left")
+        ttk.Spinbox(duration_row, from_=10, to=600, textvariable=self.chunk_duration, width=8).pack(side="left")
         ttk.Label(duration_row, text="(recommended ≤ 300)").pack(side="left", padx=(10, 0))
 
-        # Incomplete chunk policy
         policy_row = ttk.Frame(chunk_frame)
         policy_row.pack(fill="x", pady=2)
         ttk.Label(policy_row, text="Incomplete chunk policy:").pack(side="left", padx=(0, 10))
         self.truncate_policy = tk.StringVar(value="keep")
-        ttk.Radiobutton(policy_row, text="Keep", variable=self.truncate_policy,
-                        value="keep").pack(side="left")
-        ttk.Radiobutton(policy_row, text="Drop", variable=self.truncate_policy,
-                        value="drop").pack(side="left", padx=(10, 0))
+        ttk.Radiobutton(policy_row, text="Keep", variable=self.truncate_policy, value="keep").pack(side="left")
+        ttk.Radiobutton(policy_row, text="Drop", variable=self.truncate_policy, value="drop").pack(side="left", padx=(10, 0))
 
-        # Control buttons
         btn_frame = ttk.Frame(self.parent)
         btn_frame.pack(fill="x", pady=8)
-
-        self.process_btn = ttk.Button(
-            btn_frame, text="Start Transcription", command=self.start_processing,
-            style="Accent.TButton"
-        )
+        self.process_btn = ttk.Button(btn_frame, text="Start Transcription", command=self.start_processing, style="Accent.TButton")
         self.process_btn.pack(side="left", padx=(0, 8))
-
-        self.stop_btn = ttk.Button(
-            btn_frame, text="Stop", command=self.stop_processing,
-            state="disabled", style="Danger.TButton"
-        )
+        self.stop_btn = ttk.Button(btn_frame, text="Stop", command=self.stop_processing, state="disabled", style="Danger.TButton")
         self.stop_btn.pack(side="left")
 
-        # Progress bar
         self.progress = ttk.Progressbar(self.parent, mode="determinate")
         self.progress.pack(fill="x", pady=6)
 
-        # Log area
         log_frame = ttk.LabelFrame(self.parent, text="Processing Log", padding=8)
         log_frame.pack(fill="both", expand=True, pady=(8, 0))
-
         self.log_text = tk.Text(log_frame, height=12, wrap="word", state="disabled")
         scrollbar = ttk.Scrollbar(log_frame, orient="vertical", command=self.log_text.yview)
         self.log_text.configure(yscrollcommand=scrollbar.set)
-
         self.log_text.pack(side="left", fill="both", expand=True)
         scrollbar.pack(side="right", fill="y")
 
@@ -109,8 +88,17 @@ class MossTab:
         if not self.file_path or not os.path.exists(self.file_path):
             messagebox.showerror("Error", "Please select a valid audio file first.")
             return
-
         if self.is_processing:
+            return
+
+        # Validate binary and model
+        binary = self.app.binary_path_var.get().strip()
+        model = self.app.model_path_var.get().strip()
+        if not binary or not Path(binary).is_file():
+            messagebox.showerror("Error", "Please select a valid transcribe.exe in the Engine tab.")
+            return
+        if not model or not Path(model).is_file():
+            messagebox.showerror("Error", "Please select a valid MOSS model in the Engine tab.")
             return
 
         self.is_processing = True
@@ -155,10 +143,6 @@ class MossTab:
         self.parent.after(0, lambda: self.log(
             f"Audio duration: {total_samples/sr:.1f}s, splitting into {num_chunks} chunks"
         ))
-
-        if self.model is None:
-            self.parent.after(0, lambda: self.log("Loading MOSS model..."))
-            self.model = self._load_model()
 
         all_segments = []
         speaker_map = {}
@@ -225,34 +209,124 @@ class MossTab:
             if proc.returncode != 0:
                 self.parent.after(0, lambda: self.log("Error: ffmpeg failed to decode audio."))
                 return None, target_sr
-            # Convert raw 16-bit PCM to numpy float32 in [-1, 1]
             audio = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
             return audio, target_sr
         except Exception as e:
             self.parent.after(0, lambda: self.log(f"ffmpeg error: {str(e)}"))
             return None, target_sr
 
-    def _load_model(self):
-        # TODO: Replace with actual MOSS model loading from your backends
-        # e.g., from app.backends.moss_backend import load_moss_model; return load_moss_model()
-        self.parent.after(0, lambda: self.log("⚠ Using placeholder model – replace with real implementation"))
-        return "placeholder"
-
     def _transcribe_chunk(self, audio, sr):
         """
-        Transcribe one audio chunk.
-        Expected return: list of dicts with keys: start, end, speaker, text.
+        Transcribe one audio chunk using the selected transcribe.exe.
+        Returns a list of dicts with keys: start, end, speaker, text.
         """
-        # TODO: Replace with actual MOSS inference
+        # Write chunk to a temporary WAV file
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+            tmp_path = tmp.name
+        try:
+            # Write 16-bit PCM WAV using the wave module (stdlib)
+            import wave
+            with wave.open(tmp_path, "wb") as wf:
+                wf.setnchannels(1)
+                wf.setsampwidth(2)          # 16-bit
+                wf.setframerate(sr)
+                # Convert float [-1,1] to int16
+                int_audio = (audio * 32767).astype(np.int16).tobytes()
+                wf.writeframes(int_audio)
+
+            # Build command line arguments (mirroring the main engine)
+            binary = self.app.binary_path_var.get().strip()
+            model = self.app.model_path_var.get().strip()
+            backend = self.app.backend_var.get()
+            threads = self.app.resolved_threads()
+            language = self.app.language_var.get().strip()
+            if language.lower() == "auto":
+                language = "auto"
+
+            cmd = [
+                binary,
+                "--model", model,
+                "--file", tmp_path,
+                "--backend", backend.lower(),
+                "--threads", str(threads),
+                "--language", language,
+                "--output-json",      # request JSON output for structured parsing
+            ]
+
+            # Optional: add timestamps flag
+            if self.app.timestamp_var.get() == "Segment":
+                cmd.append("--timestamps")
+            elif self.app.timestamp_var.get() == "None":
+                cmd.append("--no-timestamps")
+
+            # Run the binary
+            self.parent.after(0, lambda: self.log(f"Running: {' '.join(cmd)}"))
+            proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+                errors="replace"
+            )
+            stdout, stderr = proc.communicate(timeout=300)   # 5 min per chunk
+            if proc.returncode != 0:
+                self.parent.after(0, lambda: self.log(f"Transcription failed with code {proc.returncode}"))
+                self.parent.after(0, lambda: self.log(f"stderr: {stderr}"))
+                return self._fallback_segment(audio, sr)
+
+            # Parse JSON output
+            segments = self._parse_json_output(stdout)
+            if segments is None:
+                # Fallback: treat entire stdout as raw text
+                return self._fallback_segment(audio, sr, text=stdout.strip())
+
+            return segments
+
+        except subprocess.TimeoutExpired:
+            self.parent.after(0, lambda: self.log("Transcription timed out for this chunk."))
+            return self._fallback_segment(audio, sr)
+        except Exception as e:
+            self.parent.after(0, lambda: self.log(f"Error in _transcribe_chunk: {str(e)}"))
+            return self._fallback_segment(audio, sr)
+        finally:
+            # Clean up temporary file
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+
+    def _parse_json_output(self, text):
+        """Parse the transcribe.exe JSON output into list of segments."""
+        try:
+            data = json.loads(text)
+            if "segments" in data:
+                segments = data["segments"]
+            else:
+                segments = data
+            result = []
+            for seg in segments:
+                # Expected keys: start, end, speaker, text
+                if isinstance(seg, dict):
+                    result.append({
+                        "start": seg.get("start", 0.0),
+                        "end": seg.get("end", 0.0),
+                        "speaker": seg.get("speaker", "S01"),
+                        "text": seg.get("text", "").strip(),
+                    })
+            return result if result else None
+        except json.JSONDecodeError:
+            return None
+
+    def _fallback_segment(self, audio, sr, text=None):
+        """Return a single segment covering the whole chunk."""
         duration = len(audio) / sr
-        return [
-            {
-                "start": 0.0,
-                "end": duration,
-                "speaker": "S01",
-                "text": f"[Placeholder] This chunk is {duration:.1f}s long"
-            }
-        ]
+        return [{
+            "start": 0.0,
+            "end": duration,
+            "speaker": "S01",
+            "text": text or f"[Placeholder] This chunk is {duration:.1f}s long"
+        }]
 
     def _format_transcript(self, segments):
         lines = []
