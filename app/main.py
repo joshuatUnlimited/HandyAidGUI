@@ -98,22 +98,12 @@ class RealGPUManager:
         """
         devices = []
         lines = output.splitlines()
-        # First try to find structured table with columns
-        # Many tools output a table: index, name, memory
-        # We'll try to parse lines with numbers and memory.
-        # Collect all potential device entries.
-        # We'll use regex with multiple patterns.
         patterns = [
-            # Pattern 1: "GPU 0: Name (MB)"
             r'(?:GPU|Device)\s*(\d+)\s*:\s*([^,\(]+)(?:\s*\((\d+)\s*MB\))?',
-            # Pattern 2: "Name: ..., Memory: 10240 MB"
             r'Name:\s*([^\n]+)\s*Memory:\s*(\d+)\s*MB',
-            # Pattern 3: "GPU id : 0 (Name)" then later line with memory
             r'GPU id\s*:\s*(\d+)\s*\(([^)]+)\)',
-            # Pattern 4: "Device 0: NVIDIA GeForce RTX 3080, VRAM: 10240 MB"
             r'Device\s*(\d+)\s*:\s*([^,]+),\s*VRAM:\s*(\d+)\s*MB',
         ]
-        # We'll do a two-pass: first gather all matches, then merge if needed.
         for pattern in patterns:
             for match in re.finditer(pattern, output, re.IGNORECASE):
                 groups = match.groups()
@@ -127,12 +117,9 @@ class RealGPUManager:
                         'used_memory_mb': 0,
                     })
                 elif len(groups) == 2:
-                    # Could be name & memory, or index & name
-                    # Let's see if second group is numeric -> it's memory, else name.
                     if groups[1].isdigit():
-                        # name and memory
                         name, mem = groups
-                        idx = len(devices)  # assign sequential
+                        idx = len(devices)
                         devices.append({
                             'index': idx,
                             'name': name.strip(),
@@ -141,13 +128,16 @@ class RealGPUManager:
                             'used_memory_mb': 0,
                         })
                     else:
-                        # likely index and name, but we need memory from elsewhere
+                        # index and name, memory will be filled later if found
                         idx, name = groups
-                        # We'll later try to find memory line for this device
-                        # For now, store as placeholder
-                        pass
-        # If we found devices with index, we can try to find memory lines
-        # that match "Dedicated video memory: X MB" for each.
+                        devices.append({
+                            'index': int(idx),
+                            'name': name.strip(),
+                            'total_memory_mb': 0,
+                            'free_memory_mb': 0,
+                            'used_memory_mb': 0,
+                        })
+        # If we have devices with index but no memory, try to find memory lines
         mem_lines = re.findall(r'Dedicated video memory:\s*(\d+)\s*MB', output, re.IGNORECASE)
         for i, mem in enumerate(mem_lines):
             if i < len(devices):
@@ -160,7 +150,6 @@ class RealGPUManager:
         stdout, stderr, rc = self._run_command(['vulkaninfo', '--summary'], timeout=15)
         if rc != 0:
             return []
-        # Parse summary for GPUs
         devices = []
         # Look for lines like "GPU id : 0 (NVIDIA GeForce RTX 3080)"
         for line in stdout.splitlines():
@@ -171,15 +160,11 @@ class RealGPUManager:
                 devices.append({
                     'index': idx,
                     'name': name,
-                    'total_memory_mb': 0,  # we'll fill later
+                    'total_memory_mb': 0,
                     'free_memory_mb': 0,
                     'used_memory_mb': 0,
                 })
-        # Try to get memory from lines like "Dedicated video memory: 10240 MB"
-        for dev in devices:
-            # Find the memory line near the device ID
-            # We'll search for "Dedicated video memory: X MB" after the device line
-            # Simpler: find all memory lines and assign in order.
+        # Now find memory lines and assign them in order of device index
         mem_lines = re.findall(r'Dedicated video memory:\s*(\d+)\s*MB', stdout, re.IGNORECASE)
         for i, mem in enumerate(mem_lines):
             if i < len(devices):
@@ -196,13 +181,11 @@ class RealGPUManager:
 
     def scan(self):
         """Return list of GPU devices."""
-        # First check if binary exists
         if not os.path.exists(self.binary_path):
             self._last_error = f"Transcribe binary not found at: {self.binary_path}"
             self._devices = []
             return []
 
-        # Flags to try, ordered by likelihood
         flags_to_try = [
             "--list-vulkan",
             "--list-gpu",
@@ -212,27 +195,24 @@ class RealGPUManager:
             "--gpu-list",
             "--vulkan-devices",
             "--print-devices",
-            "--help"  # often contains flag list; we can parse help to find the right flag
+            "--help"
         ]
         output, used_flag = self._try_flags(flags_to_try)
 
         devices = []
         if output:
-            # Try JSON
             parsed = self._parse_json_devices(output)
             if parsed:
                 devices = parsed
             else:
-                # Try text parsing
                 devices = self._parse_text_devices(output)
 
-        # If we have devices, return them
         if devices:
             self._devices = devices
             self._last_error = None
             return devices
 
-        # If transcribe didn't return anything, try vulkaninfo
+        # Fallback to vulkaninfo
         self._debug_logs.append("Transcribe flags failed, trying vulkaninfo fallback")
         devices = self._vulkaninfo_fallback()
         if devices:
@@ -240,7 +220,6 @@ class RealGPUManager:
             self._last_error = None
             return devices
 
-        # Nothing worked
         self._last_error = "No Vulkan-capable GPUs found. Tried transcribe flags and vulkaninfo."
         self._devices = []
         return []
@@ -249,7 +228,7 @@ class RealGPUManager:
         return self.scan()
 
     def get_usage(self, device_index):
-        return None  # Not available
+        return None
 
     def get_memory_info(self, device_index):
         for dev in self._devices:
@@ -368,9 +347,6 @@ class MossTranscribeGUI(
         self.update_elapsed()
         self.update_capabilities()
         self.update_backend_ui()
-
-        # Optional: print debug logs to console on startup (for diagnosis)
-        # print("GPU Manager debug logs:", self.gpu_manager.get_debug_logs())
 
     # ========== DELEGATE TKINTER METHODS ==========
     def after(self, ms, func):
