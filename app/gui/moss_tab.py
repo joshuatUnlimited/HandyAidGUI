@@ -1,17 +1,17 @@
 # app/gui/moss_tab.py
 
 import os
+import subprocess
 import threading
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
-import librosa
 import numpy as np
 import torch
 from app.config.settings import SUPPORTED_AUDIO
 
 
 class MossTab:
-    """MOSS audio chunking and transcription tab."""
+    """MOSS audio chunking and transcription tab (no librosa)."""
 
     def __init__(self, parent, app_window):
         self.parent = parent
@@ -144,8 +144,11 @@ class MossTab:
             self.parent.after(0, self._on_error, str(e))
 
     def _run_pipeline(self):
-        self.parent.after(0, lambda: self.log("Loading audio..."))
-        audio, sr = librosa.load(self.file_path, sr=16000, mono=True)
+        self.parent.after(0, lambda: self.log("Loading audio via ffmpeg..."))
+        audio, sr = self._load_audio_ffmpeg(self.file_path)
+        if audio is None:
+            return ""
+
         total_samples = len(audio)
         chunk_samples = int(self.chunk_duration.get() * sr)
         num_chunks = (total_samples + chunk_samples - 1) // chunk_samples
@@ -204,6 +207,30 @@ class MossTab:
         all_segments.sort(key=lambda x: x["start"])
         transcript = self._format_transcript(all_segments)
         return transcript
+
+    def _load_audio_ffmpeg(self, filepath, target_sr=16000):
+        """Load audio file using ffmpeg, return (numpy array, sample_rate)."""
+        cmd = [
+            "ffmpeg",
+            "-i", filepath,
+            "-f", "s16le",
+            "-acodec", "pcm_s16le",
+            "-ar", str(target_sr),
+            "-ac", "1",
+            "-"
+        ]
+        try:
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+            raw, _ = proc.communicate()
+            if proc.returncode != 0:
+                self.parent.after(0, lambda: self.log("Error: ffmpeg failed to decode audio."))
+                return None, target_sr
+            # Convert raw 16-bit PCM to numpy float32 in [-1, 1]
+            audio = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
+            return audio, target_sr
+        except Exception as e:
+            self.parent.after(0, lambda: self.log(f"ffmpeg error: {str(e)}"))
+            return None, target_sr
 
     def _load_model(self):
         # TODO: Replace with actual MOSS model loading from your backends
