@@ -1,5 +1,8 @@
 import os
 import queue
+import re
+import json
+import subprocess
 import threading
 import time
 import tkinter as tk
@@ -29,22 +32,142 @@ from app.output.writers import OutputWriterMixin
 from app.gui.gpu_panel import GPUControlPanelMixin
 
 
-# ================================================================
-# Robust stub that accepts any method call with any arguments
-# ================================================================
-class StubGPUManager:
-    def scan(self, *args, **kwargs):
+# ======================================================================
+# REAL GPU MANAGER – uses the transcribe binary to detect Vulkan devices
+# ======================================================================
+class RealGPUManager:
+    def __init__(self, binary_path):
+        self.binary_path = binary_path
+        self._devices = []          # cache after scan
+        self._last_error = None
+
+    def _run_binary_with_flag(self, flag):
+        """Run transcribe with the given flag and return stdout + stderr."""
+        try:
+            result = subprocess.run(
+                [self.binary_path, flag],
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=False
+            )
+            return result.stdout + "\n" + result.stderr
+        except (subprocess.TimeoutExpired, FileNotFoundError, Exception) as e:
+            return f"ERROR: {e}"
+
+    def _try_parse_json(self, output):
+        """Attempt to parse JSON output from the binary."""
+        try:
+            data = json.loads(output)
+            # Assume data is a list of devices, or a dict with a 'devices' key.
+            if isinstance(data, list):
+                return data
+            elif isinstance(data, dict) and 'devices' in data:
+                return data['devices']
+            elif isinstance(data, dict) and 'gpus' in data:
+                return data['gpus']
+        except json.JSONDecodeError:
+            pass
+        return None
+
+    def _try_parse_text(self, output):
+        """
+        Heuristic text parsing:
+        Look for lines with GPU names and memory.
+        Common patterns:
+          - "GPU 0: NVIDIA GeForce RTX 3080 (10240 MB)"
+          - "Device 0: NVIDIA RTX A6000, VRAM: 49152 MB"
+          - "Vulkan Device: ... Memory: ..."
+        """
+        devices = []
+        lines = output.splitlines()
+        for line in lines:
+            # Try to match: number, colon, name, possibly parentheses with MB.
+            # e.g. "GPU 0: NVIDIA GeForce RTX 3080 (10240 MB)"
+            match = re.search(r'(?:GPU|Device)\s*(\d+)\s*:\s*([^,\(]+)(?:\s*\((\d+)\s*MB\))?', line, re.IGNORECASE)
+            if match:
+                idx = int(match.group(1))
+                name = match.group(2).strip()
+                mem_str = match.group(3)
+                total_mem = int(mem_str) if mem_str else 0
+                devices.append({
+                    'index': idx,
+                    'name': name,
+                    'total_memory_mb': total_mem,
+                    'free_memory_mb': total_mem,   # unknown, assume full free
+                    'used_memory_mb': 0,
+                })
+                continue
+            # Another pattern: "Name: ... Memory: ..."
+            match = re.search(r'Name:\s*([^\n]+)\s*Memory:\s*(\d+)\s*MB', line, re.IGNORECASE)
+            if match:
+                name = match.group(1).strip()
+                total_mem = int(match.group(2))
+                devices.append({
+                    'index': len(devices),   # sequential index
+                    'name': name,
+                    'total_memory_mb': total_mem,
+                    'free_memory_mb': total_mem,
+                    'used_memory_mb': 0,
+                })
+        return devices
+
+    def scan(self):
+        """Return a list of GPU device dicts."""
+        # Try a few known flags
+        flags_to_try = [
+            "--list-gpu",
+            "--vulkan-devices",
+            "--gpu-info",
+            "--print-devices",
+            "--list-devices"
+        ]
+        for flag in flags_to_try:
+            output = self._run_binary_with_flag(flag)
+            # Skip if output is an error
+            if output.startswith("ERROR:"):
+                continue
+            # Try JSON first
+            devices = self._try_parse_json(output)
+            if devices is not None:
+                self._devices = devices
+                self._last_error = None
+                return devices
+            # Try text parsing
+            devices = self._try_parse_text(output)
+            if devices:
+                self._devices = devices
+                self._last_error = None
+                return devices
+
+        # If we get here, no flag worked
+        self._last_error = "No GPU list flag found; binary may not support listing."
+        self._devices = []
         return []
 
-    def enumerate_all(self, *args, **kwargs):
-        return []
+    def enumerate_all(self, extra_arg=None):
+        """Same as scan; some versions of the mixin pass an extra argument."""
+        return self.scan()
 
-    def __getattr__(self, name):
-        """Fallback: return a dummy function for any other method."""
-        def dummy(*args, **kwargs):
-            return None
-        return dummy
-# ================================================================
+    def get_usage(self, device_index):
+        """Return usage info; not easily available, so return None."""
+        return None
+
+    def get_memory_info(self, device_index):
+        """Return memory info; if we have total, return it."""
+        for dev in self._devices:
+            if dev.get('index') == device_index:
+                return {
+                    'total': dev.get('total_memory_mb', 0),
+                    'free': dev.get('free_memory_mb', 0),
+                    'used': dev.get('used_memory_mb', 0),
+                }
+        return None
+
+    @property
+    def last_error(self):
+        return self._last_error
+# ======================================================================
 
 
 class MossTranscribeGUI(
@@ -121,7 +244,7 @@ class MossTranscribeGUI(
 
         # ========== INITIALISE GPU-RELATED ATTRIBUTES ==========
         self.transcribe_binary = self.binary_path_var.get()
-        self.gpu_manager = StubGPUManager()
+        self.gpu_manager = RealGPUManager(self.transcribe_binary)
         # ========================================================
 
         # ========== ADD GPU TAB ==========
