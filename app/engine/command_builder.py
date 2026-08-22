@@ -1,6 +1,8 @@
 import os
 import re
+import shlex
 import shutil
+import subprocess
 from pathlib import Path
 
 
@@ -36,6 +38,25 @@ class CommandBuilderMixin:
             str(model.resolve()),
             str(audio.resolve()),
         )
+
+    def format_command_for_display(self, command):
+        """
+        Return a shell-style representation of a command for the GUI.
+
+        This is display-only. It must never be passed back to Popen as the
+        executable argument list. Windows uses subprocess.list2cmdline(),
+        which correctly quotes paths/arguments for Windows command-line
+        conventions; POSIX uses shlex.join().
+        """
+        if command is None:
+            return ""
+
+        parts = [str(part) for part in command]
+
+        if os.name == "nt":
+            return subprocess.list2cmdline(parts)
+
+        return shlex.join(parts)
 
     def _vulkan_runtime_device_index(self):
         """
