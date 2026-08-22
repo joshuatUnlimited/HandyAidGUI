@@ -19,6 +19,32 @@ except ImportError:
 from app.config.settings import SUPPORTED_AUDIO
 
 class AppWindowMixin:
+    # app/gui/app_window.py
+
+from app.gui.moss_tab import MossTab   # at the top
+
+class AppWindowMixin:
+    # ...
+    def build_main(self, parent):
+        # ... existing code ...
+
+        self.notebook = ttk.Notebook(main)
+        self.notebook.grid(row=1, column=0, sticky="ew")
+
+        input_tab = ttk.Frame(self.notebook, style="Panel.TFrame", padding=16)
+        runtime_tab = ttk.Frame(self.notebook, style="Panel.TFrame", padding=16)
+        output_tab = ttk.Frame(self.notebook, style="Panel.TFrame", padding=16)
+
+        self.notebook.add(input_tab, text=" Input ")
+        self.notebook.add(runtime_tab, text=" Engine ")
+        self.notebook.add(output_tab, text=" Output ")
+
+        # New MOSS tab
+        moss_tab = ttk.Frame(self.notebook, style="Panel.TFrame", padding=16)
+        self.notebook.add(moss_tab, text=" MOSS Chunk ")
+        self.moss_tab = MossTab(moss_tab, self)
+
+        # ... rest of the method ...
     def build_ui(self):
             shell = ttk.Frame(self.root)
             shell.pack(fill="both", expand=True)
