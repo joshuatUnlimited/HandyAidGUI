@@ -25,15 +25,26 @@ from app.audio.duration import AudioDurationMixin
 from app.parsing.segments import ParsingMixin
 from app.output.writers import OutputWriterMixin
 
-# ====================== GPU PANEL IMPORT ======================
+# GPU panel import
 from app.gui.gpu_panel import GPUControlPanelMixin
 
-# ====================== STUB GPU MANAGER ======================
+
+# ================================================================
+# Robust stub that catches any method call and returns empty data
+# ================================================================
 class StubGPUManager:
-    """Minimal GPU manager that prevents errors until real detection is wired."""
     def scan(self):
-        # Return an empty list – the UI will show "No GPUs detected"
         return []
+
+    def enumerate_all(self):
+        return []
+
+    def __getattr__(self, name):
+        """Fallback: return a dummy function for any other method."""
+        def dummy(*args, **kwargs):
+            return None
+        return dummy
+# ================================================================
 
 
 class MossTranscribeGUI(
@@ -104,12 +115,11 @@ class MossTranscribeGUI(
 
         self.load_settings()
         self.setup_styles()
-        self.build_ui()  # creates notebook (self.notebook)
+        self.build_ui()  # creates the notebook (self.notebook)
         self.detect_default_model()
         self.update_output_extension()
 
         # ========== INITIALISE GPU-RELATED ATTRIBUTES ==========
-        # The GPU mixin needs these two to avoid the "not configured" error.
         self.transcribe_binary = self.binary_path_var.get()
         self.gpu_manager = StubGPUManager()
         # ========================================================
