@@ -32,7 +32,7 @@ class OutputWriterMixin:
         duration = self.current_audio_duration
 
         lines = [
-            "# MOSS Transcription",
+            "# Transcription",
             "",
             f"- **Source:** `{audio_name}`",
             f"- **Model:** `{model_name}`",
