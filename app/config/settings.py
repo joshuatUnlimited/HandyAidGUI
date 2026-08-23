@@ -1,8 +1,8 @@
 import json
 from pathlib import Path
 
-APP_NAME = "MOSS Transcriber"
-APP_SUBTITLE = "Offline speech-to-text workstation"
+APP_NAME = "HandyAid"
+APP_SUBTITLE = "Offline transcription workstation — any GGUF model"
 CONFIG_FILE = Path.home() / ".moss_handy_transcriber.json"
 SUPPORTED_AUDIO = [
     ("Audio / Video", "*.wav *.mp3 *.flac *.ogg *.m4a *.wma *.aac *.mp4 *.webm"),
