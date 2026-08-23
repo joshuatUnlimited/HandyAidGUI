@@ -98,7 +98,7 @@ class AppWindowMixin:
 
         ttk.Label(sidebar, text="WORKFLOW", style="Section.TLabel").grid(row=0, column=0, sticky="w", pady=(0, 10))
         self.input_summary = self.add_sidebar_card(sidebar, 1, "1", "Input", "Choose audio/video")
-        self.model_summary = self.add_sidebar_card(sidebar, 2, "2", "Model", "Select MOSS model")
+        self.model_summary = self.add_sidebar_card(sidebar, 2, "2", "Model", "Select GGUF model")
         self.output_summary = self.add_sidebar_card(sidebar, 3, "3", "Output", "Choose file + format")
 
         ttk.Separator(sidebar).grid(row=4, column=0, sticky="ew", pady=14)
@@ -217,7 +217,7 @@ class AppWindowMixin:
         ttk.Radiobutton(speaker, text="Single-speaker / no diarization", value="single", variable=self.speaker_mode_var, command=self.refresh_summaries).pack(anchor="w")
 
     def populate_runtime_tab(self, tab):
-        ttk.Label(tab, text="MOSS GGUF model", style="Panel.TLabel", font=("Segoe UI", 11, "bold")).grid(row=0, column=0, columnspan=5, sticky="w", pady=(0, 10))
+        ttk.Label(tab, text="GGUF model", style="Panel.TLabel", font=("Segoe UI", 11, "bold")).grid(row=0, column=0, columnspan=5, sticky="w", pady=(0, 10))
         self.model_entry = ttk.Entry(tab, textvariable=self.model_path_var)
         self.model_entry.grid(row=1, column=0, columnspan=2, sticky="ew", padx=(0, 6))
         ttk.Button(tab, text="Browse…", command=self.browse_model).grid(row=1, column=2, padx=3)
@@ -328,7 +328,7 @@ class AppWindowMixin:
             self.root.dnd_bind("<<Drop>>", self.on_drop)
 
     def browse_model(self):
-        filename = filedialog.askopenfilename(title="Select MOSS Model", filetypes=[("Model Files", "*.gguf *.bin"), ("All Files", "*.*")])
+        filename = filedialog.askopenfilename(title="Select GGUF Model", filetypes=[("Model Files", "*.gguf *.bin"), ("All Files", "*.*")])
         if filename:
             self.model_path_var.set(filename)
             self.save_settings()
@@ -384,44 +384,12 @@ class AppWindowMixin:
         self.save_settings()
         self.refresh_summaries()
 
-    def update_model_status(self):
-        if not hasattr(self, "model_status_label"):
-            return
-        model = self.model_path_var.get().strip()
-        if not model or not Path(model).is_file():
-            self.model_status_label.config(text="Model compatibility: not checked", foreground=self.MUTED)
-            self.model_info = {}
-            return
-        info = self.inspect_model_compatibility(model)
-        self.model_info = info
-        self.compatible_model_candidates = info.get("candidates", [])
-        if info["compatible"] is False:
-            self.model_status_label.config(text="Model compatibility: INCOMPATIBLE — see Diagnose model", foreground=self.DANGER)
-        elif info["compatible"] is True:
-            self.model_status_label.config(text="Model compatibility: compatible MOSS GGUF", foreground=self.SUCCESS)
-        else:
-            self.model_status_label.config(text="Model compatibility: backend validation required", foreground=self.WARNING)
-
-    def diagnose_model(self):
-        model = self.model_path_var.get().strip()
-        if not model or not Path(model).is_file():
-            messagebox.showerror("Model diagnosis", "Select a valid GGUF model first.")
-            return
-        info = self.inspect_model_compatibility(model)
-        self.model_info = info
-        self.compatible_model_candidates = info.get("candidates", [])
-        self.update_model_status()
-        lines = [
-            f"File: {info['name']}",
-            f"Architecture: {info.get('architecture') or 'unknown'}",
-            f"Source: {info.get('source') or 'unknown'}",
-            "",
-            info.get("reason", "No assessment available."),
-        ]
-        if info.get("candidates"):
-            lines.extend(["", "Handy/transcribe.cpp-style models found in the same folder:"])
-            lines.extend(f"• {item}" for item in info["candidates"][:8])
-        messagebox.showinfo("MOSS model diagnosis", "\n".join(lines))
+    # update_model_status() and diagnose_model() live in ModelCompatibilityMixin
+    # (app/models/compatibility.py). They used to be duplicated here too; since
+    # AppWindowMixin comes before ModelCompatibilityMixin in the mixin order in
+    # main.py, this copy was silently winning and the compatibility.py methods
+    # were dead code. Removed rather than fixed in place, since compatibility
+    # logic belongs in the compatibility module, not the GUI shell.
 
     def update_backend_ui(self):
         selected = self.backend_var.get()
