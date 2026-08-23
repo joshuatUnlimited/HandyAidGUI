@@ -92,8 +92,12 @@ GB = 1024 ** 3
 
 DEFAULT_SAFETY_RATIO = 0.85       # required = model_size / safety_ratio
 DEFAULT_RESERVE_MB = 512          # fixed VRAM held back per GPU, beyond the ratio
-SAFETY_RATIO_MIN = 0.30
-SAFETY_RATIO_MAX = 0.99
+# Must match the clamp in app/backends/gpu_manager.py's choose_workers().
+# Keeping these in sync is exactly what the module docstring warns about;
+# until the two implementations are consolidated, treat this pair of
+# constants as the single source of truth for the clamp bounds.
+SAFETY_RATIO_MIN = 0.50
+SAFETY_RATIO_MAX = 0.90
 
 SCAN_POLL_INTERVAL_MS = 150       # how often we check the rescan queue
 LIVE_REFRESH_INTERVAL_MS = 5000   # how often we cheaply re-probe VRAM
@@ -174,7 +178,11 @@ def compute_weighted_chunks(
 
     required_bytes: Optional[float] = None
     if model_size_bytes:
-        safe_ratio = max(safety_ratio, 0.01)  # guard a garbage/zero ratio
+        # Clamped to the same [MIN, MAX] range gpu_manager.choose_workers()
+        # enforces server-side -- a ratio outside this range would be
+        # silently overridden there, so eligibility computed here must
+        # agree with what actually runs.
+        safe_ratio = max(SAFETY_RATIO_MIN, min(SAFETY_RATIO_MAX, safety_ratio))
         required_bytes = model_size_bytes / safe_ratio
 
     usable: dict[int, int] = {}  # index -> free bytes after reserve, enabled GPUs only
