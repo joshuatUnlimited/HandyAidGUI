@@ -13,7 +13,7 @@ class CommandBuilderMixin:
         binary = Path(self.binary_path_var.get().strip()).expanduser()
 
         if not model.is_file():
-            raise ValueError("Please select a valid MOSS GGUF model file.")
+            raise ValueError("Please select a valid GGUF model file.")
         if not audio.is_file():
             raise ValueError("Please select a valid audio/video file.")
 
@@ -86,7 +86,7 @@ class CommandBuilderMixin:
         return 0
 
     def build_command(self, binary, model, audio):
-        # Match the documented MOSS command shape while only passing options
+        # Match transcribe-cli's documented command shape while only passing options
         # advertised by the installed executable.
         requested_backend = self.backend_var.get().strip().lower()
         cmd = [binary]
@@ -160,7 +160,7 @@ class CommandBuilderMixin:
             and re.fullmatch(r"[a-z]{2,3}", language_raw)
         ):
             if self.backend_supports("--language", "-l"):
-                # -l is the documented MOSS short form.
+                # -l is transcribe-cli's documented short form.
                 cmd.extend(["-l", language_raw])
             elif self.backend_options:
                 self.ui_queue.put(
