@@ -396,30 +396,41 @@ class TranscriptionEngineMixin:
                 candidates = VulkanGPUManager.choose_workers(
                     gpus, model_size_bytes=model_size
                 )
-                eligible, excluded = VulkanGPUManager.collapse_shared_memory_pools(
+
+                duplicates = VulkanGPUManager.find_likely_shared_memory_duplicates(
                     candidates
                 )
-
-                if excluded:
+                if duplicates:
                     self.ui_queue.put(
                         (
                             "log",
-                            "Excluded as likely duplicate/shared-memory entries "
-                            "(reported the same capacity as another selected "
-                            "device — probably one physical adapter listed "
-                            "twice, e.g. duplicate Vulkan ICDs on an iGPU, not "
-                            "independent VRAM pools): "
-                            + ", ".join(f"GPU {g.index}" for g in excluded)
-                            + "\n",
+                            "Note: "
+                            + ", ".join(f"GPU {g.index}" for g in duplicates)
+                            + " report the same description and nearly the "
+                            "same memory as another selected GPU. If these "
+                            "are actually one physical shared-memory device "
+                            "seen twice (common with iGPUs / duplicate "
+                            "Vulkan drivers), running independent workers on "
+                            "both at once can allocate against the same pool "
+                            "twice. If you know these are separate physical "
+                            "GPUs (a matched pair), this is expected and "
+                            "safe to ignore.\n",
                         )
                     )
 
-                if candidates and not eligible:
+                # Only raise when real GPUs were found but NONE of them can
+                # safely hold the model — not merely because the duplicate
+                # check above flagged something (that check no longer
+                # removes anyone from `candidates`, so this can no longer
+                # trip on a false positive from that heuristic).
+                if not candidates:
                     raise RuntimeError(
                         "No selected GPU has enough reported free memory to "
                         "safely hold the model.\n\n"
                         + VulkanGPUManager.format_plan(gpus, model_size)
                     )
+
+                eligible = candidates
 
             if eligible:
                 self.ui_queue.put(
@@ -468,18 +479,47 @@ class TranscriptionEngineMixin:
                 )
             )
 
+            # Group windows by the GPU that owns them and run each GPU's
+            # windows SEQUENTIALLY within one dedicated thread. This
+            # matters: a plain ThreadPoolExecutor sized by GPU count and
+            # fed one task per WINDOW does not guarantee two windows
+            # assigned to the same physical GPU never run at the same
+            # time — it just runs whichever queued tasks come up next.
+            # Two transcribe-cli processes loading a full model onto the
+            # same physical adapter concurrently is exactly the kind of
+            # thing that can produce an allocation failure, so each GPU
+            # gets exactly one worker thread that drains its own queue
+            # one subprocess at a time; different GPUs' threads run in
+            # parallel with each other.
+            windows_by_gpu: dict = {}
+            for i, (win_start, win_end, nominal_start, nominal_end) in enumerate(
+                windows
+            ):
+                gpu = assign_gpu(nominal_start)
+                key = gpu.index if gpu is not None else None
+                windows_by_gpu.setdefault(key, []).append(
+                    (i, win_start, win_end, nominal_start, nominal_end, gpu)
+                )
+
             progress_state = {i: 0.0 for i in range(len(windows))}
             progress_lock = threading.Lock()
-            futures = {}
 
-            max_workers = max(1, len(eligible) or 1)
-            with ThreadPoolExecutor(max_workers=max_workers) as pool:
-                for i, (win_start, win_end, nominal_start, nominal_end) in enumerate(
-                    windows
-                ):
-                    gpu = assign_gpu(nominal_start)
+            def run_gpu_queue(window_list):
+                queue_results = {}
+                for (i, win_start, win_end, nominal_start, nominal_end, gpu) in window_list:
+                    if self.cancel_requested.is_set():
+                        queue_results[i] = {
+                            "device": gpu,
+                            "offset_s": win_start,
+                            "returncode": -1,
+                            "raw_output": "",
+                            "segments": [],
+                            "nominal_start": nominal_start,
+                            "nominal_end": nominal_end,
+                        }
+                        continue
+
                     shard = chunk_dir / f"win_{i:04d}_{int(win_start * 1000):012d}.wav"
-
                     ffmpeg_cmd = [
                         ffmpeg,
                         "-y",
@@ -495,7 +535,6 @@ class TranscriptionEngineMixin:
                         "1",
                         str(shard),
                     ]
-
                     prep = subprocess.run(
                         ffmpeg_cmd,
                         stdout=subprocess.DEVNULL,
@@ -515,39 +554,49 @@ class TranscriptionEngineMixin:
 
                     worker_cmd = list(cmd)
                     worker_cmd[-1] = str(shard)
-
                     worker_env = self.vulkan_environment(
                         visible_ids=(gpu.index,) if gpu is not None else None
                     )
 
-                    futures[
-                        pool.submit(
-                            self._run_gpu_worker,
-                            worker_cmd,
-                            gpu,
-                            worker_env,
-                            str(shard),
-                            win_start,
-                            win_end - win_start,
-                            progress_state,
-                            progress_lock,
-                            i,
-                        )
-                    ] = (i, nominal_start, nominal_end, win_start)
-
-                results_by_index = {}
-                for future in as_completed(futures):
-                    i, nominal_start, nominal_end, win_start = futures[future]
-                    result = future.result()
+                    result = self._run_gpu_worker(
+                        worker_cmd, gpu, worker_env, str(shard),
+                        win_start, win_end - win_start,
+                        progress_state, progress_lock, i,
+                    )
                     result["nominal_start"] = nominal_start
                     result["nominal_end"] = nominal_end
-                    result["offset_s"] = win_start
-                    results_by_index[i] = result
+                    queue_results[i] = result
+
+                return queue_results
+
+            results_by_index = {}
+            with ThreadPoolExecutor(max_workers=max(1, len(windows_by_gpu))) as pool:
+                futures = [
+                    pool.submit(run_gpu_queue, wlist)
+                    for wlist in windows_by_gpu.values()
+                ]
+                for future in as_completed(futures):
+                    results_by_index.update(future.result())
 
             ordered = [results_by_index[i] for i in range(len(windows))]
 
             failed = [r for r in ordered if r["returncode"] != 0]
             if failed:
+                if self.cancel_requested.is_set():
+                    self.ui_queue.put(
+                        (
+                            "finished",
+                            (
+                                failed[0]["returncode"],
+                                True,
+                                "\n\n".join(r["raw_output"] for r in ordered),
+                                [],
+                                time.monotonic() - started,
+                            ),
+                        )
+                    )
+                    return
+
                 detail = failed[0]["raw_output"][-3000:]
                 gpu_label = (
                     failed[0]["device"].index
@@ -559,7 +608,7 @@ class TranscriptionEngineMixin:
                         "finished",
                         (
                             failed[0]["returncode"],
-                            self.cancel_requested.is_set(),
+                            False,
                             "\n\n".join(r["raw_output"] for r in ordered),
                             [],
                             time.monotonic() - started,
