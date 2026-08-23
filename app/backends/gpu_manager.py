@@ -274,57 +274,132 @@ class VulkanGPUManager:
             and gpu.memory_free >= required
         ]
 
-    @staticmethod
-    def weighted_chunks(
-        duration_s: float,
+    @classmethod
+    def collapse_shared_memory_pools(
+        cls,
         gpus: list[VulkanGPU],
-    ):
+        tolerance: float = 0.02,
+    ) -> tuple[list[VulkanGPU], list[VulkanGPU]]:
         """
-        Weight audio duration by available VRAM.
+        Group GPUs that appear to report the SAME underlying memory pool
+        and keep only one representative per group.
 
-        Equal-memory GPUs receive equal time. A GPU with twice the available
-        VRAM receives approximately twice the audio duration.
+        transcribe-cli's --list-devices output (as parsed by
+        parse_list_devices) carries no verified field that identifies
+        unified/shared memory directly — if your build's output does
+        include a uma/shared-memory marker, tell me the exact line format
+        and this can key off that instead, which would be more precise.
 
-        This is intentionally capacity-based. It is not a benchmark-derived
-        performance model.
+        What IS verifiable from the data already parsed here: two
+        genuinely independent dedicated GPUs essentially never report
+        byte-identical total memory. Two selected entries that DO match
+        within `tolerance` are treated as the same physical memory pool
+        reported twice (e.g. duplicate Vulkan ICD registration on one
+        iGPU) rather than as double the real, independent capacity —
+        which is what let choose_workers/weighted_chunks previously
+        schedule two full model loads against a single shared RAM pool
+        at once.
+
+        Returns (kept, excluded).
+        """
+        groups: dict[int, list[VulkanGPU]] = {}
+        for gpu in gpus:
+            bucket = None
+            for key, members in groups.items():
+                reference = members[0].memory_total
+                if reference and abs(gpu.memory_total - reference) <= reference * tolerance:
+                    bucket = key
+                    break
+            if bucket is None:
+                bucket = gpu.index
+                groups[bucket] = []
+            groups[bucket].append(gpu)
+
+        kept: list[VulkanGPU] = []
+        excluded: list[VulkanGPU] = []
+        for members in groups.values():
+            members_sorted = sorted(members, key=lambda g: g.index)
+            kept.append(members_sorted[0])
+            excluded.extend(members_sorted[1:])
+
+        kept.sort(key=lambda g: g.index)
+        excluded.sort(key=lambda g: g.index)
+        return kept, excluded
+
+    @staticmethod
+    def weighted_boundaries(duration_s: float, gpus: list[VulkanGPU]):
+        """
+        Nominal (non-overlapping) time boundaries per GPU, weighted by
+        free memory. This only decides which GPU EXECUTES which small
+        window (see sequential_windows) — it is no longer responsible
+        for bounding how much audio any single transcribe-cli call
+        receives, which is the actual crash-safety property.
         """
         if duration_s <= 0 or not gpus:
             return []
 
-        weights = [
-            max(1.0, gpu.memory_free)
-            for gpu in gpus
-        ]
-        total_weight = sum(weights)
+        weights = [max(1.0, gpu.memory_free) for gpu in gpus]
+        total = sum(weights)
 
-        result = []
-        start = 0.0
+        bounds = [0.0]
+        running = 0.0
+        for w in weights[:-1]:
+            running += duration_s * (w / total)
+            bounds.append(running)
+        bounds.append(duration_s)
 
-        for index, (gpu, weight) in enumerate(
-            zip(gpus, weights)
-        ):
-            if index == len(gpus) - 1:
-                end = duration_s
-            else:
-                end = (
-                    start
-                    + duration_s
-                    * (weight / total_weight)
-                )
+        return [(gpu, bounds[i], bounds[i + 1]) for i, gpu in enumerate(gpus)]
 
-            result.append(
-                (
-                    gpu,
-                    start,
-                    max(
-                        0.01,
-                        end - start,
-                    ),
-                )
+    @staticmethod
+    def sequential_windows(
+        start: float,
+        end: float,
+        window_s: float = 25.0,
+        overlap_s: float = 4.0,
+    ):
+        """
+        Split [start, end] into small overlapping windows, independent
+        of GPU count. This bounds how much audio any single
+        transcribe-cli call ever receives — the actual fix for
+        "failed to allocate ... buffer of size ~19GB", since that
+        allocation scales with input length, not model size or GPU
+        count. A single-GPU (or CPU) machine needs this exactly as
+        much as a multi-GPU one does.
+
+        Each window is returned as
+        (window_start, window_end, nominal_start, nominal_end) —
+        window_start/end include the overlap padding actually sent to
+        the model for context; nominal_start/end is the boundary this
+        window OWNS in the stitched output (used by ai_sbu_core to
+        avoid duplicate/dropped text at cut points).
+        """
+        if window_s <= overlap_s:
+            raise ValueError("window_s must be greater than overlap_s")
+        if end <= start:
+            return []
+
+        windows = []
+        nominal_start = start
+        step = window_s - overlap_s
+
+        while nominal_start < end:
+            nominal_end = min(nominal_start + step, end)
+            win_start = (
+                max(start, nominal_start - overlap_s)
+                if nominal_start > start
+                else nominal_start
             )
-            start = end
+            win_end = (
+                min(end, nominal_end + overlap_s)
+                if nominal_end < end
+                else nominal_end
+            )
+            windows.append((win_start, win_end, nominal_start, nominal_end))
+            if nominal_end >= end:
+                break
+            nominal_start = nominal_end
 
-        return result
+        return windows
 
     @staticmethod
     def format_plan(
