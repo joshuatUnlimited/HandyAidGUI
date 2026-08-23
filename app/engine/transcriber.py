@@ -40,20 +40,20 @@ class TranscriptionEngineMixin:
         if model_info.get("compatible") is False:
             details = model_info.get(
                 "reason",
-                "The selected model is incompatible with this backend.",
+                "The selected file could not be read as a GGUF model.",
             )
             if self.compatible_model_candidates:
                 details += (
-                    "\n\nCompatible MOSS model(s) found in the same folder:\n"
+                    "\n\nMOSS GGUF model(s) found in the same folder:\n"
                     + "\n".join(self.compatible_model_candidates[:6])
                 )
             details += (
                 "\n\nThe GUI stopped before FFmpeg conversion, so your 75-minute "
                 "recording was not processed unnecessarily."
             )
-            self.append_log("\n--- Model compatibility failure ---\n" + details + "\n")
-            self.status_var.set("Incompatible model")
-            messagebox.showerror("Incompatible MOSS model", details)
+            self.append_log("\n--- Model check failed ---\n" + details + "\n")
+            self.status_var.set("Invalid model file")
+            messagebox.showerror("Invalid model file", details)
             return
 
         output = Path(output_text).expanduser()
@@ -69,7 +69,7 @@ class TranscriptionEngineMixin:
             self.append_log(help_text + "\n")
         elif help_text:
             self.append_log(
-                "Backend help detected; using documented MOSS command syntax.\n"
+                "Backend help detected; using documented transcribe-cli command syntax.\n"
             )
 
         backend_ok, backend_message = self.verify_requested_backend(binary)
@@ -202,7 +202,7 @@ class TranscriptionEngineMixin:
                     ("command", self.format_command_for_display(cmd))
                 )
                 self.ui_queue.put(
-                    ("log", "Converted input to 16 kHz mono WAV for MOSS.\n")
+                    ("log", "Converted input to 16 kHz mono WAV.\n")
                 )
 
             creationflags = (
