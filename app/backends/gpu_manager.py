@@ -274,167 +274,57 @@ class VulkanGPUManager:
             and gpu.memory_free >= required
         ]
 
-    @classmethod
-    def find_likely_shared_memory_duplicates(
-        cls,
-        gpus: list[VulkanGPU],
-        tolerance: float = 0.02,
-    ) -> list[VulkanGPU]:
-        """
-        Flag (do NOT remove) GPUs whose description and memory_total
-        both match another selected GPU closely enough that they might
-        be one physical shared-memory device registered twice (e.g.
-        duplicate Vulkan ICD registration on an iGPU) rather than two
-        independent memory pools.
-
-        This is deliberately informational only. An earlier version of
-        this method excluded the duplicate from scheduling, but the
-        only signals --list-devices actually provides here (description
-        text, memory_total) can't reliably tell that case apart from two
-        genuinely separate, IDENTICAL dedicated GPUs — a matched
-        multi-GPU pair (e.g. two RTX 4090s bought specifically for this
-        kind of workload) reports the same description and the same
-        memory_total too. Auto-excluding on this signal would silently
-        break real parallelism for exactly the hardware this feature is
-        for. So this only warns; it never changes what choose_workers
-        returns. If your transcribe-cli build's --list-devices output
-        has an actual shared-memory/uma marker, send the exact line and
-        this can be tightened to use that instead of guessing.
-        """
-        groups: dict[int, list[VulkanGPU]] = {}
-        for gpu in gpus:
-            bucket = None
-            for key, members in groups.items():
-                ref = members[0]
-                if (
-                    ref.description == gpu.description
-                    and ref.memory_total
-                    and abs(gpu.memory_total - ref.memory_total) <= ref.memory_total * tolerance
-                ):
-                    bucket = key
-                    break
-            if bucket is None:
-                bucket = gpu.index
-                groups[bucket] = []
-            groups[bucket].append(gpu)
-
-        flagged: list[VulkanGPU] = []
-        for members in groups.values():
-            if len(members) > 1:
-                flagged.extend(sorted(members, key=lambda g: g.index)[1:])
-
-        flagged.sort(key=lambda g: g.index)
-        return flagged
-
     @staticmethod
     def weighted_chunks(
         duration_s: float,
         gpus: list[VulkanGPU],
     ):
         """
-        Legacy API, kept for backward compatibility with any other
-        caller (e.g. a GPU control panel preview) that may already
-        depend on this exact signature/behavior. AI SBU itself now
-        uses weighted_boundaries + sequential_windows instead, which
-        additionally bounds each transcribe-cli call's audio length —
-        this method does NOT provide that bound, so don't route new
-        transcription work through it.
+        Weight audio duration by available VRAM.
 
-        Weight audio duration by available VRAM. Equal-memory GPUs
-        receive equal time; a GPU with twice the available VRAM
-        receives approximately twice the audio duration.
+        Equal-memory GPUs receive equal time. A GPU with twice the available
+        VRAM receives approximately twice the audio duration.
+
+        This is intentionally capacity-based. It is not a benchmark-derived
+        performance model.
         """
         if duration_s <= 0 or not gpus:
             return []
 
-        weights = [max(1.0, gpu.memory_free) for gpu in gpus]
+        weights = [
+            max(1.0, gpu.memory_free)
+            for gpu in gpus
+        ]
         total_weight = sum(weights)
 
         result = []
         start = 0.0
-        for index, (gpu, weight) in enumerate(zip(gpus, weights)):
+
+        for index, (gpu, weight) in enumerate(
+            zip(gpus, weights)
+        ):
             if index == len(gpus) - 1:
                 end = duration_s
             else:
-                end = start + duration_s * (weight / total_weight)
-            result.append((gpu, start, max(0.01, end - start)))
+                end = (
+                    start
+                    + duration_s
+                    * (weight / total_weight)
+                )
+
+            result.append(
+                (
+                    gpu,
+                    start,
+                    max(
+                        0.01,
+                        end - start,
+                    ),
+                )
+            )
             start = end
+
         return result
-
-    @staticmethod
-    def weighted_boundaries(duration_s: float, gpus: list[VulkanGPU]):
-        """
-        Nominal (non-overlapping) time boundaries per GPU, weighted by
-        free memory. This only decides which GPU EXECUTES which small
-        window (see sequential_windows) — it is no longer responsible
-        for bounding how much audio any single transcribe-cli call
-        receives, which is the actual crash-safety property.
-        """
-        if duration_s <= 0 or not gpus:
-            return []
-
-        weights = [max(1.0, gpu.memory_free) for gpu in gpus]
-        total = sum(weights)
-
-        bounds = [0.0]
-        running = 0.0
-        for w in weights[:-1]:
-            running += duration_s * (w / total)
-            bounds.append(running)
-        bounds.append(duration_s)
-
-        return [(gpu, bounds[i], bounds[i + 1]) for i, gpu in enumerate(gpus)]
-
-    @staticmethod
-    def sequential_windows(
-        start: float,
-        end: float,
-        window_s: float = 25.0,
-        overlap_s: float = 4.0,
-    ):
-        """
-        Split [start, end] into small overlapping windows, independent
-        of GPU count. This bounds how much audio any single
-        transcribe-cli call ever receives — the actual fix for
-        "failed to allocate ... buffer of size ~19GB", since that
-        allocation scales with input length, not model size or GPU
-        count. A single-GPU (or CPU) machine needs this exactly as
-        much as a multi-GPU one does.
-
-        Each window is returned as
-        (window_start, window_end, nominal_start, nominal_end) —
-        window_start/end include the overlap padding actually sent to
-        the model for context; nominal_start/end is the boundary this
-        window OWNS in the stitched output (used by ai_sbu_core to
-        avoid duplicate/dropped text at cut points).
-        """
-        if window_s <= overlap_s:
-            raise ValueError("window_s must be greater than overlap_s")
-        if end <= start:
-            return []
-
-        windows = []
-        nominal_start = start
-        step = window_s - overlap_s
-
-        while nominal_start < end:
-            nominal_end = min(nominal_start + step, end)
-            win_start = (
-                max(start, nominal_start - overlap_s)
-                if nominal_start > start
-                else nominal_start
-            )
-            win_end = (
-                min(end, nominal_end + overlap_s)
-                if nominal_end < end
-                else nominal_end
-            )
-            windows.append((win_start, win_end, nominal_start, nominal_end))
-            if nominal_end >= end:
-                break
-            nominal_start = nominal_end
-
-        return windows
 
     @staticmethod
     def format_plan(

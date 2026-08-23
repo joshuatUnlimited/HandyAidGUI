@@ -1,279 +1,167 @@
-"""Minimal AI SBU stitching and speaker reconciliation."""
+"""
+AI SBU core — Small overlapping windows, Big stitched-back transcript,
+United speaker labels.
+
+Renamed/rebuilt from the old balanced-multi-GPU "chunk" path. Works
+directly on the segment-dict shape run_ai_sbu_transcription already
+produces (dicts with 'start', 'end', 'text', optional 'speaker') —
+nothing here assumes a specific model. Any model whose parser fills
+those keys works: a model that never sets 'speaker' just gets an
+empty speaker map and passes through unchanged, and a model that
+diarizes gets its per-window labels reconciled into one consistent
+set of global speaker IDs.
+
+No Tk, no subprocess — pure post-processing over what the per-window
+workers already returned.
+"""
 
 from __future__ import annotations
 
-from copy import deepcopy
-from itertools import permutations
-
-try:
-    from scipy.optimize import linear_sum_assignment
-except Exception:  # optional; greedy/exhaustive fallback works without scipy
-    linear_sum_assignment = None
+from collections import defaultdict
+from typing import Callable, Optional
 
 
-MODEL_PRESETS = {
-    "parakeet": {
-        "label": "Parakeet — overlap matching",
-        "min_overlap_s": 0.20,
-    },
-    "moss": {
-        "label": "MOSS — overlap matching",
-        "min_overlap_s": 0.15,
-    },
-    "generic": {
-        "label": "Generic — overlap matching",
-        "min_overlap_s": 0.20,
-    },
-}
+def stitch_segment_shards(shard_results: list[dict]) -> list[dict]:
+    """
+    shard_results: ordered by nominal_start (as produced by
+    run_ai_sbu_transcription — one dict per window, each with
+    'nominal_start' and 'segments' already offset to absolute time).
+
+    Ownership rule: window 0 owns everything it produced. Every later
+    window only contributes segments starting at/after its own
+    nominal_start — anything earlier fell inside its LEADING overlap
+    padding, which the previous window already owns from its TRAILING
+    overlap padding. This avoids duplicate/garbled text at cut points
+    without trying to fuzzy-match two independently-run transcriptions
+    against each other (they may not even agree on wording).
+
+    Each returned segment is tagged with '_shard_index' so
+    apply_speaker_map can look up the right global label without a
+    second time-based pass.
+    """
+    merged = []
+    for i, shard in enumerate(shard_results):
+        boundary = shard["nominal_start"]
+        for seg in shard["segments"]:
+            if i == 0 or seg["start"] >= boundary:
+                tagged = dict(seg)
+                tagged["_shard_index"] = i
+                merged.append(tagged)
+    merged.sort(key=lambda s: s["start"])
+    return merged
 
 
-def _speaker_key(value):
-    if value is None or value == "":
-        return None
-    return str(value)
+def _overlap_evidence(prev: dict, cur: dict, overlap_s: float):
+    boundary = cur["nominal_start"]
+    prev_tail = [s for s in prev["segments"] if s["start"] >= boundary - overlap_s]
+    cur_head = [s for s in cur["segments"] if s["start"] < boundary + overlap_s]
+    return prev_tail, cur_head
 
 
-def _model_family(model_path=None):
-    text = str(model_path or "").lower()
-    if "parakeet" in text:
-        return "parakeet"
-    if "moss" in text:
-        return "moss"
-    return "generic"
+def _heuristic_reconcile(prev_tail: list[dict], cur_head: list[dict]) -> dict:
+    """
+    Default reconciler: votes on which raw speaker labels co-occur at
+    close timestamps in the overlap window. No AI call. Good enough
+    when the overlap is unambiguous (one speaker talking through the
+    boundary); leaves ambiguous cases unmapped so the caller mints a
+    fresh global label instead of guessing wrong.
+    """
+    votes = defaultdict(int)
+    for p in prev_tail:
+        p_speaker = p.get("speaker")
+        if not p_speaker:
+            continue
+        for c in cur_head:
+            c_speaker = c.get("speaker")
+            if not c_speaker:
+                continue
+            if abs(p["start"] - c["start"]) < max(2.0, p["end"] - p["start"]):
+                votes[(p_speaker, c_speaker)] += 1
+
+    mapping: dict = {}
+    used = set()
+    for (p_lbl, c_lbl), _ in sorted(votes.items(), key=lambda kv: -kv[1]):
+        if p_lbl in used or c_lbl in mapping:
+            continue
+        mapping[c_lbl] = p_lbl
+        used.add(p_lbl)
+    return mapping  # cur raw label -> prev raw label
 
 
-def _overlap(a, b, start, end):
-    left = max(float(a.get("start", 0.0)), float(b.get("start", 0.0)), start)
-    right = min(float(a.get("end", 0.0)), float(b.get("end", 0.0)), end)
-    return max(0.0, right - left)
+# Optional callback for ambiguous overlaps — same (prev_tail, cur_head)
+# evidence as the heuristic, same return shape (cur raw label -> prev
+# raw label). Wire your own model-specific logic or an LLM call here;
+# return {} (or raise) to fall back to the heuristic.
+ReconcilerFn = Callable[[list, list], dict]
 
 
-def _pair_scores(prev_segments, curr_segments, overlap_start, overlap_end):
-    prev_ids = sorted({
-        _speaker_key(s.get("speaker"))
-        for s in prev_segments
-        if _speaker_key(s.get("speaker")) is not None
-    })
-    curr_ids = sorted({
-        _speaker_key(s.get("speaker"))
-        for s in curr_segments
-        if _speaker_key(s.get("speaker")) is not None
-    })
-
-    scores = {}
-    for prev_id in prev_ids:
-        for curr_id in curr_ids:
-            total = 0.0
-            for a in prev_segments:
-                if _speaker_key(a.get("speaker")) != prev_id:
-                    continue
-                for b in curr_segments:
-                    if _speaker_key(b.get("speaker")) != curr_id:
-                        continue
-                    total += _overlap(a, b, overlap_start, overlap_end)
-            scores[(prev_id, curr_id)] = total
-
-    return prev_ids, curr_ids, scores
-
-
-def _assign(prev_ids, curr_ids, scores):
-    if not prev_ids or not curr_ids:
+def reconcile_speaker_labels(
+    shard_results: list[dict],
+    overlap_s: float = 4.0,
+    reconciler: Optional[ReconcilerFn] = None,
+) -> dict:
+    """
+    Returns {shard_index_str: {raw_label: global_label}}, one entry
+    per window in shard_results (already ordered by nominal_start).
+    A window whose segments carry no 'speaker' key at all (a model
+    that doesn't diarize) gets an empty map and is left untouched —
+    this is what makes the function safe to call unconditionally
+    regardless of which model produced the segments.
+    """
+    if not shard_results:
         return {}
 
-    if linear_sum_assignment is not None:
-        import numpy as np
+    speaker_map: dict = {}
+    first_labels = sorted({
+        s.get("speaker") for s in shard_results[0]["segments"] if s.get("speaker")
+    })
+    speaker_map["0"] = {lbl: lbl for lbl in first_labels}
 
-        matrix = np.zeros((len(prev_ids), len(curr_ids)), dtype=float)
-        for i, prev_id in enumerate(prev_ids):
-            for j, curr_id in enumerate(curr_ids):
-                matrix[i, j] = scores.get((prev_id, curr_id), 0.0)
-
-        rows, cols = linear_sum_assignment(-matrix)
-
-        return {
-            curr_ids[j]: prev_ids[i]
-            for i, j in zip(rows, cols)
-            if matrix[i, j] > 0.0
-        }
-
-    # Tiny fallback for models with only a few speaker slots.
-    best = {}
-    best_score = -1.0
-    width = min(len(prev_ids), len(curr_ids))
-
-    for prev_perm in permutations(prev_ids, width):
-        candidate = {}
-        score = 0.0
-        for curr_id, prev_id in zip(curr_ids[:width], prev_perm):
-            value = scores.get((prev_id, curr_id), 0.0)
-            score += value
-            if value > 0:
-                candidate[curr_id] = prev_id
-
-        if score > best_score:
-            best_score = score
-            best = candidate
-
-    return best
-
-
-def stitch_segment_shards(results):
-    """Stitch chunk results while dropping duplicated overlap segments."""
-    stitched = []
-
-    for chunk_index, result in enumerate(results):
-        nominal_start = float(
-            result.get("nominal_start", result.get("offset_s", 0.0))
-        )
-
-        for raw in result.get("segments", []) or []:
-            seg = deepcopy(raw)
-            seg["_chunk_index"] = chunk_index
-
-            midpoint = (
-                float(seg.get("start", 0.0))
-                + float(seg.get("end", 0.0))
-            ) / 2.0
-
-            # Previous chunk owns the overlap region.
-            if chunk_index and midpoint < nominal_start:
-                continue
-
-            stitched.append(seg)
-
-    stitched.sort(
-        key=lambda s: (
-            float(s.get("start", 0.0)),
-            float(s.get("end", 0.0)),
-        )
-    )
-    return stitched
-
-
-def reconcile_speaker_labels(results, overlap_s=4.0, model_path=None):
-    """Map local chunk speaker slots onto stable global Speaker N labels."""
-    preset = MODEL_PRESETS[_model_family(model_path)]
-    speaker_map = {}
-    next_global_id = 1
-
-    for chunk_index, result in enumerate(results):
-        current_segments = result.get("segments", []) or []
-        current_ids = sorted({
-            _speaker_key(s.get("speaker"))
-            for s in current_segments
-            if _speaker_key(s.get("speaker")) is not None
-        })
-
-        if chunk_index == 0:
-            for local_id in current_ids:
-                speaker_map[(chunk_index, local_id)] = (
-                    f"Speaker {next_global_id}"
-                )
-                next_global_id += 1
+    for i in range(1, len(shard_results)):
+        prev, cur = shard_results[i - 1], shard_results[i]
+        cur_labels = sorted({s.get("speaker") for s in cur["segments"] if s.get("speaker")})
+        if not cur_labels:
+            speaker_map[str(i)] = {}
             continue
 
-        previous = results[chunk_index - 1]
-        previous_segments = previous.get("segments", []) or []
+        prev_tail, cur_head = _overlap_evidence(prev, cur, overlap_s)
 
-        previous_start = float(previous.get("offset_s", 0.0))
-        current_start = float(result.get("offset_s", 0.0))
+        raw_to_prev = {}
+        if reconciler is not None:
+            try:
+                raw_to_prev = reconciler(prev_tail, cur_head) or {}
+            except Exception:
+                raw_to_prev = {}
+        if not raw_to_prev:
+            raw_to_prev = _heuristic_reconcile(prev_tail, cur_head)
 
-        previous_end = max(
-            (float(s.get("end", previous_start)) for s in previous_segments),
-            default=previous_start,
-        )
-
-        overlap_start = max(previous_start, current_start)
-        overlap_end = min(
-            previous_end,
-            current_start + overlap_s,
-        )
-
-        assignments = {}
-
-        if overlap_end - overlap_start >= preset["min_overlap_s"]:
-            prev_ids, curr_ids, scores = _pair_scores(
-                previous_segments,
-                current_segments,
-                overlap_start,
-                overlap_end,
-            )
-            assignments = _assign(prev_ids, curr_ids, scores)
-
-        for local_id in current_ids:
-            previous_local_id = assignments.get(local_id)
-
-            global_id = None
-            if previous_local_id is not None:
-                global_id = speaker_map.get(
-                    (chunk_index - 1, previous_local_id)
-                )
-
-            if global_id is None:
-                global_id = f"Speaker {next_global_id}"
-                next_global_id += 1
-
-            speaker_map[(chunk_index, local_id)] = global_id
+        prev_map = speaker_map[str(i - 1)]
+        cur_map = {}
+        for raw in cur_labels:
+            prev_raw = raw_to_prev.get(raw)
+            if prev_raw and prev_raw in prev_map:
+                cur_map[raw] = prev_map[prev_raw]
+            else:
+                seen = {v for m in speaker_map.values() for v in m.values()}
+                cur_map[raw] = f"Speaker_{len(seen)}"
+        speaker_map[str(i)] = cur_map
 
     return speaker_map
 
 
-def apply_speaker_map(segments, speaker_map):
-    output = []
-
+def apply_speaker_map(segments: list[dict], speaker_map: dict) -> list[dict]:
+    """
+    Rewrite each stitched segment's 'speaker' using the global map
+    (matched via the '_shard_index' tag stitch_segment_shards left
+    behind), and strip that internal tag from the output.
+    """
+    out = []
     for seg in segments:
-        item = dict(seg)
-        chunk_index = item.pop("_chunk_index", None)
-        local_id = _speaker_key(item.get("speaker"))
-
-        if local_id is not None and chunk_index is not None:
-            item["speaker"] = speaker_map.get(
-                (chunk_index, local_id),
-                item.get("speaker"),
-            )
-
-        output.append(item)
-
-    return output
-
-
-def load_united_file(path):
-    import json
-
-    with open(path, "r", encoding="utf-8") as fh:
-        data = json.load(fh)
-
-    if isinstance(data, list):
-        return data
-
-    if isinstance(data, dict):
-        for key in ("segments", "results", "chunks"):
-            if isinstance(data.get(key), list):
-                return data[key]
-
-    return []
-
-
-def save_united_file(path, segments):
-    import json
-    from pathlib import Path
-
-    Path(path).parent.mkdir(parents=True, exist_ok=True)
-
-    with open(path, "w", encoding="utf-8") as fh:
-        json.dump(
-            {"segments": segments},
-            fh,
-            ensure_ascii=False,
-            indent=2,
-        )
-
-
-__all__ = [
-    "MODEL_PRESETS",
-    "stitch_segment_shards",
-    "reconcile_speaker_labels",
-    "apply_speaker_map",
-    "load_united_file",
-    "save_united_file",
-]
+        idx = seg.get("_shard_index")
+        new_seg = {k: v for k, v in seg.items() if k != "_shard_index"}
+        raw = new_seg.get("speaker")
+        if raw:
+            gmap = speaker_map.get(str(idx), {})
+            new_seg["speaker"] = gmap.get(raw, raw)
+        out.append(new_seg)
+    return out

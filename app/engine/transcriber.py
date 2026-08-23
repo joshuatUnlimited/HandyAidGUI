@@ -11,11 +11,6 @@ from pathlib import Path
 from tkinter import messagebox
 
 from app.backends.gpu_manager import VulkanGPUManager
-from app.engine.ai_sbu_core import (
-    stitch_segment_shards,
-    reconcile_speaker_labels,
-    apply_speaker_map,
-)
 
 
 class TranscriptionEngineMixin:
@@ -115,21 +110,16 @@ class TranscriptionEngineMixin:
                 self.status_var.set("Configuration error")
                 return
 
-            # AI SBU (Small overlapping windows, Big stitched-back transcript,
-            # United speaker labels) is always active for the Vulkan backend
-            # now, regardless of GPU count or diarization mode. Bounding each
-            # transcribe-cli call's audio length is what prevents the ggml
-            # compute-graph reserve from blowing up on long files, and the
-            # overlap + speaker reconciliation is what makes that safe even
-            # when diarization is on — the old code disabled chunking for
-            # multi-speaker mode entirely because nothing reconciled speaker
-            # identity across shards; this replaces that restriction.
-            self.append_log(
-                "AI SBU is active: audio is split into small overlapping "
-                "windows regardless of GPU count, and speaker labels are "
-                "reconciled across window boundaries using the overlap "
-                "regions.\n"
-            )
+            if len(selected_ids) > 1 and self.speaker_mode_var.get() == "multi":
+                self.append_log(
+                    "Multi-GPU balancing is disabled for multi-speaker mode. "
+                    "Diarization is kept in one process so speaker identity remains consistent.\n"
+                )
+            elif len(selected_ids) > 1:
+                self.append_log(
+                    "Multi-GPU balancing is available for this single-speaker run. "
+                    "Each GPU must independently fit the model; audio is divided by available VRAM.\n"
+                )
 
         self.current_output_path = output
         self.current_audio_path = audio
@@ -174,13 +164,17 @@ class TranscriptionEngineMixin:
 
         self.save_settings()
 
-        # AI SBU always chunks for the Vulkan backend — see the log message
-        # above. CPU/Auto backends still use the single-process path for now.
-        use_ai_sbu = self.backend_var.get().strip().lower() == "vulkan"
+        use_balanced = False
+        if self.backend_var.get().strip().lower() == "vulkan":
+            selected_ids = self.vulkan_device_ids()
+            use_balanced = (
+                len(selected_ids) > 1
+                and self.speaker_mode_var.get() != "multi"
+            )
 
         target = (
-            self.run_ai_sbu_transcription
-            if use_ai_sbu
+            self.run_balanced_transcription
+            if use_balanced
             else self.run_transcription
         )
         self.worker = threading.Thread(
@@ -328,41 +322,20 @@ class TranscriptionEngineMixin:
             if temp_wav:
                 self.cleanup_temp_file(temp_wav)
 
-    def run_ai_sbu_transcription(
+    def run_balanced_transcription(
         self,
         cmd,
         audio_path,
         model_path,
         binary,
-        window_s: float = 25.0,
-        overlap_s: float = 4.0,
     ):
         """
-        AI SBU: Small overlapping windows, Big stitched-back transcript,
-        United speaker labels.
+        Capacity-balanced multi-GPU execution.
 
-        Renamed/rebuilt from run_balanced_transcription. Two changes from
-        the old "balanced" pipeline:
-
-        1. Audio is ALWAYS split into small bounded windows (window_s),
-           regardless of GPU count. This is the actual fix for
-           "failed to allocate ... buffer of size ~19GB" — that scales
-           with how much audio one transcribe-cli call receives, not
-           with model size or GPU count, so a single-iGPU machine needs
-           this exactly as much as a multi-GPU one did.
-        2. Windows overlap by overlap_s and are stitched back together
-           with speaker-label reconciliation (app/engine/ai_sbu_core.py),
-           so this now works for diarizing models too — the old code
-           explicitly disabled chunked mode for multi-speaker audio
-           because independently-run shards produced inconsistent
-           speaker IDs; that's exactly what reconcile_speaker_labels
-           resolves, using each window's overlap with its neighbor as
-           evidence.
-
-        GPU assignment still uses free-memory weighting the same way
-        the old balanced path did, but it no longer bounds chunk size —
-        chunk size is fixed by window_s/overlap_s and applies whether
-        there are 0, 1, or several eligible GPUs.
+        IMPORTANT: this is not model tensor splitting. Each worker process
+        loads the full model on one Vulkan GPU. The method is therefore guarded
+        by per-GPU free-memory checks and only uses GPUs that appear able to
+        hold the model independently.
         """
         started = time.monotonic()
         temp_audio = None
@@ -371,170 +344,126 @@ class TranscriptionEngineMixin:
 
         try:
             device_ids = self.vulkan_device_ids()
+            if len(device_ids) < 2:
+                self.ui_queue.put(
+                    (
+                        "log",
+                        "Fewer than two Vulkan GPUs are selected; using normal single-process mode.\n",
+                    )
+                )
+                return self.run_transcription(
+                    cmd,
+                    audio_path,
+                    model_path,
+                    binary,
+                )
 
             prepared_audio, temp_audio = self.prepare_audio(audio_path)
             duration = self.get_audio_duration(prepared_audio)
             if not duration:
                 raise RuntimeError(
-                    "AI SBU requires a measurable audio duration."
+                    "Balanced multi-GPU mode requires a measurable audio duration."
                 )
 
             model_size = Path(model_path).stat().st_size
-            gpus = VulkanGPUManager.probe(binary, device_ids) if device_ids else []
+            gpus = VulkanGPUManager.probe(binary, device_ids)
 
-            eligible = []
-            if gpus:
-                self.ui_queue.put(
-                    (
-                        "log",
-                        "\n--- Vulkan GPU memory plan ---\n"
-                        + VulkanGPUManager.format_plan(gpus, model_size)
-                        + "\n",
-                    )
+            self.ui_queue.put(
+                (
+                    "log",
+                    "\n--- Vulkan GPU memory plan ---\n"
+                    + VulkanGPUManager.format_plan(gpus, model_size)
+                    + "\n",
                 )
-
-                candidates = VulkanGPUManager.choose_workers(
-                    gpus, model_size_bytes=model_size
-                )
-
-                duplicates = VulkanGPUManager.find_likely_shared_memory_duplicates(
-                    candidates
-                )
-                if duplicates:
-                    self.ui_queue.put(
-                        (
-                            "log",
-                            "Note: "
-                            + ", ".join(f"GPU {g.index}" for g in duplicates)
-                            + " report the same description and nearly the "
-                            "same memory as another selected GPU. If these "
-                            "are actually one physical shared-memory device "
-                            "seen twice (common with iGPUs / duplicate "
-                            "Vulkan drivers), running independent workers on "
-                            "both at once can allocate against the same pool "
-                            "twice. If you know these are separate physical "
-                            "GPUs (a matched pair), this is expected and "
-                            "safe to ignore.\n",
-                        )
-                    )
-
-                # Only raise when real GPUs were found but NONE of them can
-                # safely hold the model — not merely because the duplicate
-                # check above flagged something (that check no longer
-                # removes anyone from `candidates`, so this can no longer
-                # trip on a false positive from that heuristic).
-                if not candidates:
-                    raise RuntimeError(
-                        "No selected GPU has enough reported free memory to "
-                        "safely hold the model.\n\n"
-                        + VulkanGPUManager.format_plan(gpus, model_size)
-                    )
-
-                eligible = candidates
-
-            if eligible:
-                self.ui_queue.put(
-                    (
-                        "log",
-                        "Eligible GPUs: "
-                        + ", ".join(str(g.index) for g in eligible)
-                        + "\n",
-                    )
-                )
-                boundaries = VulkanGPUManager.weighted_boundaries(duration, eligible)
-            else:
-                self.ui_queue.put(
-                    (
-                        "log",
-                        "No eligible Vulkan GPU; running AI SBU windows on the "
-                        "backend's default device.\n",
-                    )
-                )
-                boundaries = [(None, 0.0, duration)]
-
-            def assign_gpu(nominal_start):
-                for gpu, b_start, b_end in boundaries:
-                    if b_start <= nominal_start < b_end:
-                        return gpu
-                return boundaries[-1][0] if boundaries else None
-
-            windows = VulkanGPUManager.sequential_windows(
-                0.0, duration, window_s, overlap_s
             )
-            if not windows:
-                raise RuntimeError("AI SBU produced no chunks for this audio.")
+
+            eligible = VulkanGPUManager.choose_workers(
+                gpus,
+                model_size_bytes=model_size,
+            )
+
+            if len(eligible) < 2:
+                available = ", ".join(
+                    f"GPU {gpu.index} ({gpu.free_gib:.2f} GiB free)"
+                    for gpu in gpus
+                )
+                raise RuntimeError(
+                    "Automatic multi-GPU mode was blocked because fewer than "
+                    "two selected GPUs have enough reported free memory to "
+                    "safely hold an independent copy of the model.\n\n"
+                    f"{available}\n\n"
+                    "This backend cannot split one model across GPUs, so "
+                    "starting another full model copy would risk an OOM."
+                )
+
+            self.ui_queue.put(
+                (
+                    "log",
+                    "Eligible GPUs: "
+                    + ", ".join(
+                        str(gpu.index) for gpu in eligible
+                    )
+                    + "\n",
+                )
+            )
 
             ffmpeg = shutil.which("ffmpeg")
             if not ffmpeg:
                 raise RuntimeError(
-                    "AI SBU requires ffmpeg to create audio windows."
+                    "Balanced multi-GPU mode requires ffmpeg to create audio shards."
                 )
 
-            chunk_dir = Path(tempfile.mkdtemp(prefix="ai_sbu_shards_"))
+            chunk_dir = Path(
+                tempfile.mkdtemp(prefix="moss_gpu_shards_")
+            )
+            chunks = VulkanGPUManager.weighted_chunks(
+                duration,
+                eligible,
+            )
+
             self.ui_queue.put(
                 (
                     "log",
-                    f"AI SBU: {len(windows)} window(s), {window_s:.0f}s "
-                    f"(+{overlap_s:.0f}s overlap) each.\n",
+                    "Audio distribution:\n"
+                    + "\n".join(
+                        f"  GPU {gpu.index}: {chunk_len:.1f}s "
+                        f"starting at {start:.1f}s"
+                        for gpu, start, chunk_len in chunks
+                    )
+                    + "\n",
                 )
             )
 
-            # Group windows by the GPU that owns them and run each GPU's
-            # windows SEQUENTIALLY within one dedicated thread. This
-            # matters: a plain ThreadPoolExecutor sized by GPU count and
-            # fed one task per WINDOW does not guarantee two windows
-            # assigned to the same physical GPU never run at the same
-            # time — it just runs whichever queued tasks come up next.
-            # Two transcribe-cli processes loading a full model onto the
-            # same physical adapter concurrently is exactly the kind of
-            # thing that can produce an allocation failure, so each GPU
-            # gets exactly one worker thread that drains its own queue
-            # one subprocess at a time; different GPUs' threads run in
-            # parallel with each other.
-            windows_by_gpu: dict = {}
-            for i, (win_start, win_end, nominal_start, nominal_end) in enumerate(
-                windows
-            ):
-                gpu = assign_gpu(nominal_start)
-                key = gpu.index if gpu is not None else None
-                windows_by_gpu.setdefault(key, []).append(
-                    (i, win_start, win_end, nominal_start, nominal_end, gpu)
-                )
-
-            progress_state = {i: 0.0 for i in range(len(windows))}
+            progress_state = {
+                gpu.index: 0.0 for gpu, _, _ in chunks
+            }
             progress_lock = threading.Lock()
+            futures = {}
 
-            def run_gpu_queue(window_list):
-                queue_results = {}
-                for (i, win_start, win_end, nominal_start, nominal_end, gpu) in window_list:
-                    if self.cancel_requested.is_set():
-                        queue_results[i] = {
-                            "device": gpu,
-                            "offset_s": win_start,
-                            "returncode": -1,
-                            "raw_output": "",
-                            "segments": [],
-                            "nominal_start": nominal_start,
-                            "nominal_end": nominal_end,
-                        }
-                        continue
+            with ThreadPoolExecutor(
+                max_workers=len(chunks)
+            ) as pool:
+                for gpu, start_s, length_s in chunks:
+                    shard = chunk_dir / (
+                        f"gpu_{gpu.index}_{int(start_s * 1000):012d}.wav"
+                    )
 
-                    shard = chunk_dir / f"win_{i:04d}_{int(win_start * 1000):012d}.wav"
                     ffmpeg_cmd = [
                         ffmpeg,
                         "-y",
                         "-ss",
-                        f"{win_start:.6f}",
+                        f"{start_s:.6f}",
                         "-i",
                         prepared_audio,
                         "-t",
-                        f"{(win_end - win_start):.6f}",
+                        f"{length_s:.6f}",
                         "-ar",
                         "16000",
                         "-ac",
                         "1",
                         str(shard),
                     ]
+
                     prep = subprocess.run(
                         ffmpeg_cmd,
                         stdout=subprocess.DEVNULL,
@@ -548,95 +477,94 @@ class TranscriptionEngineMixin:
                     )
                     if prep.returncode != 0:
                         raise RuntimeError(
-                            f"ffmpeg could not create AI SBU window {i}:\n"
+                            f"ffmpeg could not create shard for GPU {gpu.index}:\n"
                             f"{prep.stderr[-1500:]}"
                         )
 
                     worker_cmd = list(cmd)
                     worker_cmd[-1] = str(shard)
+
                     worker_env = self.vulkan_environment(
-                        visible_ids=(gpu.index,) if gpu is not None else None
+                        visible_ids=(gpu.index,)
                     )
 
-                    result = self._run_gpu_worker(
-                        worker_cmd, gpu, worker_env, str(shard),
-                        win_start, win_end - win_start,
-                        progress_state, progress_lock, i,
-                    )
-                    result["nominal_start"] = nominal_start
-                    result["nominal_end"] = nominal_end
-                    queue_results[i] = result
-
-                return queue_results
-
-            results_by_index = {}
-            with ThreadPoolExecutor(max_workers=max(1, len(windows_by_gpu))) as pool:
-                futures = [
-                    pool.submit(run_gpu_queue, wlist)
-                    for wlist in windows_by_gpu.values()
-                ]
-                for future in as_completed(futures):
-                    results_by_index.update(future.result())
-
-            ordered = [results_by_index[i] for i in range(len(windows))]
-
-            failed = [r for r in ordered if r["returncode"] != 0]
-            if failed:
-                if self.cancel_requested.is_set():
-                    self.ui_queue.put(
-                        (
-                            "finished",
-                            (
-                                failed[0]["returncode"],
-                                True,
-                                "\n\n".join(r["raw_output"] for r in ordered),
-                                [],
-                                time.monotonic() - started,
-                            ),
+                    futures[
+                        pool.submit(
+                            self._run_gpu_worker,
+                            worker_cmd,
+                            gpu,
+                            worker_env,
+                            str(shard),
+                            start_s,
+                            length_s,
+                            progress_state,
+                            progress_lock,
                         )
-                    )
-                    return
+                    ] = gpu.index
 
+                results = {}
+                for future in as_completed(futures):
+                    gpu_index = futures[future]
+                    result = future.result()
+                    results[gpu_index] = result
+
+            ordered = [
+                results[gpu.index]
+                for gpu, _, _ in chunks
+            ]
+
+            failed = [
+                result for result in ordered
+                if result["returncode"] != 0
+            ]
+
+            if failed:
                 detail = failed[0]["raw_output"][-3000:]
-                gpu_label = (
-                    failed[0]["device"].index
-                    if failed[0]["device"] is not None
-                    else "default"
-                )
                 self.ui_queue.put(
                     (
                         "finished",
                         (
                             failed[0]["returncode"],
-                            False,
-                            "\n\n".join(r["raw_output"] for r in ordered),
+                            self.cancel_requested.is_set(),
+                            "\n\n".join(
+                                result["raw_output"]
+                                for result in ordered
+                            ),
                             [],
                             time.monotonic() - started,
                             (
-                                f"AI SBU window failed on GPU {gpu_label}.\n\n"
-                                f"{detail}"
+                                f"Balanced GPU worker failed on GPU "
+                                f"{failed[0]['device'].index}.\n\n{detail}"
                             ),
                         ),
                     )
                 )
                 return
 
-            for r in ordered:
-                for seg in r["segments"]:
-                    seg["start"] += r["offset_s"]
-                    seg["end"] += r["offset_s"]
-
-            stitched = stitch_segment_shards(ordered)
-            speaker_map = reconcile_speaker_labels(ordered, overlap_s=overlap_s)
-            all_segments = apply_speaker_map(stitched, speaker_map)
-            all_segments.sort(key=lambda item: (item["start"], item["end"]))
-
+            all_segments = []
             raw_parts = []
-            for r in ordered:
-                raw_parts.append(f"\n--- window @ {r['offset_s']:.3f}s ---\n")
-                raw_parts.append(r["raw_output"])
-            raw_output = "".join(raw_parts)
 
+            for result in ordered:
+                raw_parts.append(
+                    f"\n--- GPU {result['device'].index} shard "
+                    f"({result['offset_s']:.3f}s) ---\n"
+                )
+                raw_parts.append(result["raw_output"])
+
+                for segment in result["segments"]:
+                    adjusted = dict(segment)
+                    adjusted["start"] += result["offset_s"]
+                    adjusted["end"] += result["offset_s"]
+                    all_segments.append(adjusted)
+
+            all_segments.sort(
+                key=lambda item: (
+                    item["start"],
+                    item["end"],
+                )
+            )
+
+            raw_output = "".join(raw_parts)
             self.ui_queue.put(
                 (
                     "finished",
@@ -683,7 +611,6 @@ class TranscriptionEngineMixin:
         length_s,
         progress_state,
         progress_lock,
-        progress_key,
     ):
         creationflags = (
             subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
@@ -700,7 +627,7 @@ class TranscriptionEngineMixin:
             env=env,
         )
 
-        self.processes[progress_key] = process
+        self.processes[gpu.index] = process
         output = []
 
         try:
@@ -717,14 +644,13 @@ class TranscriptionEngineMixin:
                             line,
                         )
                     ]
-
                     if end_times:
                         local_time = min(
                             length_s,
                             max(end_times),
                         )
                         with progress_lock:
-                            progress_state[progress_key] = (
+                            progress_state[gpu.index] = (
                                 local_time / max(0.001, length_s)
                             )
                             total = sum(
@@ -739,13 +665,12 @@ class TranscriptionEngineMixin:
                                 min(100.0, total * 100.0),
                             )
                         )
-                        gpu_label = gpu.index if gpu is not None else "default"
                         self.ui_queue.put(
                             (
                                 "status",
                                 (
-                                    f"AI SBU window {progress_key} running "
-                                    f"(GPU {gpu_label})"
+                                    f"GPU workers running: "
+                                    f"{gpu.index}"
                                 ),
                             )
                         )
@@ -771,7 +696,7 @@ class TranscriptionEngineMixin:
                 "segments": segments,
             }
         finally:
-            self.processes.pop(progress_key, None)
+            self.processes.pop(gpu.index, None)
 
     def cleanup_temp_file(self, path):
         for _ in range(5):
