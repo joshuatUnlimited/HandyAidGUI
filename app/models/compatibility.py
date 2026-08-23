@@ -1,5 +1,6 @@
 import os
 from pathlib import Path
+from tkinter import messagebox
 
 from app.models.gguf import read_gguf_metadata
 
@@ -27,12 +28,18 @@ class ModelCompatibilityMixin:
             info["name"] = meta.get("general.name") or path.name
             info["source"] = meta.get("general.source.url") or meta.get("general.source.huggingface.repository")
         except (OSError, ValueError) as exc:
-            info["reason"] = f"Could not inspect GGUF metadata: {exc}"
+            # This is the only real gate: the file itself isn't a readable
+            # GGUF. Which architecture it declares is not this GUI's call --
+            # transcribe-cli is the actual authority on what it can run.
+            info["compatible"] = False
+            info["reason"] = f"Could not read this file as a GGUF model: {exc}"
             return info
+
+        info["compatible"] = True
 
         name = path.name.lower()
         source = (info["source"] or "").lower()
-        recommended = (
+        moss_markers = (
             "moss-transcribe-diarize-q4_k_m",
             "moss-transcribe-diarize-q5_k_m",
             "moss-transcribe-diarize-q6_k",
@@ -44,35 +51,33 @@ class ModelCompatibilityMixin:
             "crispasr" in source
             or "moss-transcribe-diarize-0.9b-q4_k" in name
         )
-        is_handy_named = any(x in name for x in recommended)
+        is_moss_named = any(x in name for x in moss_markers)
         # Handy's published MOSS GGUFs identify the family in filenames, while
         # the GGUF general.architecture field may be the generic "moss" value.
-        # Do not require the backend-specific internal label here; the previous
-        # checker incorrectly rejected valid Handy models reporting "moss".
         is_moss_architecture = info["architecture"] in {"moss", "moss_transcribe_diarize"}
 
         if is_crispasr:
-            info["compatible"] = False
             info["reason"] = (
-                "This is the 0.9B q4_k MOSS conversion distributed for CrispASR. "
-                "It is not the MOSS GGUF family documented for the Handy transcribe.cpp executable."
+                "This looks like the 0.9B q4_k MOSS conversion distributed for CrispASR, "
+                "not the MOSS GGUF family this GUI was originally documented against. "
+                "It may still load fine -- if transcribe-cli rejects it, the error will "
+                "show in the Process Log."
             )
-        elif is_handy_named and is_moss_architecture:
-            info["compatible"] = True
-            info["reason"] = "GGUF filename and architecture match the Handy transcribe.cpp MOSS Transcribe-Diarize model family."
-        elif is_moss_architecture:
-            info["compatible"] = None
-            info["reason"] = "GGUF architecture is MOSS-compatible; backend validation will confirm the exact conversion."
+        elif is_moss_named and is_moss_architecture:
+            info["reason"] = "Filename and architecture match the documented MOSS Transcribe-Diarize family."
         elif info["architecture"]:
-            info["compatible"] = False
-            info["reason"] = f"GGUF architecture '{info['architecture']}' is not moss_transcribe_diarize."
+            info["reason"] = (
+                f"Architecture: '{info['architecture']}'. Not the MOSS family this GUI "
+                "was originally built around, but any GGUF transcribe-cli's --help "
+                "advertises support for should work here."
+            )
         else:
-            info["reason"] = "No GGUF architecture metadata was found. Backend validation is required."
+            info["reason"] = "No architecture metadata found in the GGUF. transcribe-cli will validate it at run time."
 
         try:
             for candidate in sorted(path.parent.glob("*.gguf")):
                 c = candidate.name.lower()
-                if any(x in c for x in recommended):
+                if any(x in c for x in moss_markers):
                     info["candidates"].append(str(candidate))
         except OSError:
             pass
@@ -83,18 +88,17 @@ class ModelCompatibilityMixin:
             return
         model = self.model_path_var.get().strip()
         if not model or not Path(model).is_file():
-            self.model_status_label.config(text="Model compatibility: not checked", foreground=self.MUTED)
+            self.model_status_label.config(text="Model check: not checked", foreground=self.MUTED)
             self.model_info = {}
             return
         info = self.inspect_model_compatibility(model)
         self.model_info = info
         self.compatible_model_candidates = info.get("candidates", [])
         if info["compatible"] is False:
-            self.model_status_label.config(text="Model compatibility: INCOMPATIBLE — see Diagnose model", foreground=self.DANGER)
-        elif info["compatible"] is True:
-            self.model_status_label.config(text="Model compatibility: compatible MOSS GGUF", foreground=self.SUCCESS)
+            self.model_status_label.config(text="Model check: UNREADABLE — see Diagnose model", foreground=self.DANGER)
         else:
-            self.model_status_label.config(text="Model compatibility: backend validation required", foreground=self.WARNING)
+            arch = info.get("architecture") or "unknown architecture"
+            self.model_status_label.config(text=f"Model check: valid GGUF ({arch})", foreground=self.SUCCESS)
 
     def diagnose_model(self):
         model = self.model_path_var.get().strip()
@@ -113,9 +117,9 @@ class ModelCompatibilityMixin:
             info.get("reason", "No assessment available."),
         ]
         if info.get("candidates"):
-            lines.extend(["", "Handy/transcribe.cpp-style models found in the same folder:"])
+            lines.extend(["", "MOSS-family GGUF(s) also found in the same folder:"])
             lines.extend(f"• {item}" for item in info["candidates"][:8])
-        messagebox.showinfo("MOSS model diagnosis", "\n".join(lines))
+        messagebox.showinfo("Model diagnosis", "\n".join(lines))
 
     def detect_default_model(self):
         candidates = []
@@ -131,8 +135,7 @@ class ModelCompatibilityMixin:
             seen.add(directory)
             try:
                 for path in sorted(directory.iterdir()):
-                    lower = path.name.lower()
-                    if path.is_file() and (lower.endswith(".gguf") or (lower.endswith(".bin") and "moss" in lower)):
+                    if path.is_file() and path.name.lower().endswith(".gguf"):
                         candidates.append(path)
             except OSError:
                 continue
@@ -141,7 +144,7 @@ class ModelCompatibilityMixin:
         if candidates:
             self.status_var.set(f"Model found: {candidates[0].name}")
         elif not self.model_path_var.get().strip():
-            self.status_var.set("No MOSS model detected")
+            self.status_var.set("No GGUF model detected")
         self.refresh_summaries()
         self.update_capabilities()
         self.update_backend_ui()
