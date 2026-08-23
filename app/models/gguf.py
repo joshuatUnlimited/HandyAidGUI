@@ -32,7 +32,7 @@ def read_gguf_metadata(path, wanted_keys):
                 n=struct.unpack("<Q",f.read(8))[0]
                 for _ in range(n): skip_value(item_type)
                 return
-            raise ValueError(f"Unsupported GGUF metadata type {{vtype}}")
+            raise ValueError(f"Unsupported GGUF metadata type {vtype}")
         result={}
         for _ in range(kv_count):
             raw=f.read(8)
