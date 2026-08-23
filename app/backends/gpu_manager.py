@@ -275,39 +275,42 @@ class VulkanGPUManager:
         ]
 
     @classmethod
-    def collapse_shared_memory_pools(
+    def find_likely_shared_memory_duplicates(
         cls,
         gpus: list[VulkanGPU],
         tolerance: float = 0.02,
-    ) -> tuple[list[VulkanGPU], list[VulkanGPU]]:
+    ) -> list[VulkanGPU]:
         """
-        Group GPUs that appear to report the SAME underlying memory pool
-        and keep only one representative per group.
+        Flag (do NOT remove) GPUs whose description and memory_total
+        both match another selected GPU closely enough that they might
+        be one physical shared-memory device registered twice (e.g.
+        duplicate Vulkan ICD registration on an iGPU) rather than two
+        independent memory pools.
 
-        transcribe-cli's --list-devices output (as parsed by
-        parse_list_devices) carries no verified field that identifies
-        unified/shared memory directly — if your build's output does
-        include a uma/shared-memory marker, tell me the exact line format
-        and this can key off that instead, which would be more precise.
-
-        What IS verifiable from the data already parsed here: two
-        genuinely independent dedicated GPUs essentially never report
-        byte-identical total memory. Two selected entries that DO match
-        within `tolerance` are treated as the same physical memory pool
-        reported twice (e.g. duplicate Vulkan ICD registration on one
-        iGPU) rather than as double the real, independent capacity —
-        which is what let choose_workers/weighted_chunks previously
-        schedule two full model loads against a single shared RAM pool
-        at once.
-
-        Returns (kept, excluded).
+        This is deliberately informational only. An earlier version of
+        this method excluded the duplicate from scheduling, but the
+        only signals --list-devices actually provides here (description
+        text, memory_total) can't reliably tell that case apart from two
+        genuinely separate, IDENTICAL dedicated GPUs — a matched
+        multi-GPU pair (e.g. two RTX 4090s bought specifically for this
+        kind of workload) reports the same description and the same
+        memory_total too. Auto-excluding on this signal would silently
+        break real parallelism for exactly the hardware this feature is
+        for. So this only warns; it never changes what choose_workers
+        returns. If your transcribe-cli build's --list-devices output
+        has an actual shared-memory/uma marker, send the exact line and
+        this can be tightened to use that instead of guessing.
         """
         groups: dict[int, list[VulkanGPU]] = {}
         for gpu in gpus:
             bucket = None
             for key, members in groups.items():
-                reference = members[0].memory_total
-                if reference and abs(gpu.memory_total - reference) <= reference * tolerance:
+                ref = members[0]
+                if (
+                    ref.description == gpu.description
+                    and ref.memory_total
+                    and abs(gpu.memory_total - ref.memory_total) <= ref.memory_total * tolerance
+                ):
                     bucket = key
                     break
             if bucket is None:
@@ -315,16 +318,48 @@ class VulkanGPUManager:
                 groups[bucket] = []
             groups[bucket].append(gpu)
 
-        kept: list[VulkanGPU] = []
-        excluded: list[VulkanGPU] = []
+        flagged: list[VulkanGPU] = []
         for members in groups.values():
-            members_sorted = sorted(members, key=lambda g: g.index)
-            kept.append(members_sorted[0])
-            excluded.extend(members_sorted[1:])
+            if len(members) > 1:
+                flagged.extend(sorted(members, key=lambda g: g.index)[1:])
 
-        kept.sort(key=lambda g: g.index)
-        excluded.sort(key=lambda g: g.index)
-        return kept, excluded
+        flagged.sort(key=lambda g: g.index)
+        return flagged
+
+    @staticmethod
+    def weighted_chunks(
+        duration_s: float,
+        gpus: list[VulkanGPU],
+    ):
+        """
+        Legacy API, kept for backward compatibility with any other
+        caller (e.g. a GPU control panel preview) that may already
+        depend on this exact signature/behavior. AI SBU itself now
+        uses weighted_boundaries + sequential_windows instead, which
+        additionally bounds each transcribe-cli call's audio length —
+        this method does NOT provide that bound, so don't route new
+        transcription work through it.
+
+        Weight audio duration by available VRAM. Equal-memory GPUs
+        receive equal time; a GPU with twice the available VRAM
+        receives approximately twice the audio duration.
+        """
+        if duration_s <= 0 or not gpus:
+            return []
+
+        weights = [max(1.0, gpu.memory_free) for gpu in gpus]
+        total_weight = sum(weights)
+
+        result = []
+        start = 0.0
+        for index, (gpu, weight) in enumerate(zip(gpus, weights)):
+            if index == len(gpus) - 1:
+                end = duration_s
+            else:
+                end = start + duration_s * (weight / total_weight)
+            result.append((gpu, start, max(0.01, end - start)))
+            start = end
+        return result
 
     @staticmethod
     def weighted_boundaries(duration_s: float, gpus: list[VulkanGPU]):
