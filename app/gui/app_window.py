@@ -21,8 +21,6 @@ from app.gui.moss_tab import MossTab   # <-- Import added here
 
 
 class AppWindowMixin:
-    # All methods from your original file follow, indented with 4 spaces.
-
     def build_ui(self):
         shell = ttk.Frame(self.root)
         shell.pack(fill="both", expand=True)
