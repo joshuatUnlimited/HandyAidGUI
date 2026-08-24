@@ -170,6 +170,44 @@ class VulkanGPUManager:
         return env
 
     @classmethod
+    def probe_all(cls, binary: str) -> list[VulkanGPU]:
+        """
+        Enumerate every Vulkan adapter the backend can see, with no
+        GGML_VK_VISIBLE_DEVICES restriction applied.
+
+        Used to sanity-check a saved/selected device-ID list against what
+        physically exists before committing to multi-GPU balanced mode.
+        Some Vulkan ICDs silently ignore an out-of-range
+        GGML_VK_VISIBLE_DEVICES value instead of failing, which would
+        otherwise let two different "selected" physical IDs both resolve
+        to the same real (often UMA/iGPU) adapter.
+        """
+        flags = (
+            subprocess.CREATE_NO_WINDOW
+            if os.name == "nt"
+            else 0
+        )
+
+        result = subprocess.run(
+            [binary, "--list-devices"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=15,
+            creationflags=flags,
+        )
+
+        if result.returncode != 0:
+            raise RuntimeError(
+                "Could not enumerate Vulkan devices.\n\n"
+                f"{(result.stdout or '')[-2500:]}"
+            )
+
+        return cls.parse_list_devices(result.stdout or "")
+
+    @classmethod
     def probe(
         cls,
         binary: str,
@@ -184,6 +222,29 @@ class VulkanGPUManager:
         """
         if not physical_ids:
             return []
+
+        # Sanity-check against an unrestricted enumeration first. Without
+        # this, a stale/corrupted multi-device selection on a single-adapter
+        # (often UMA iGPU) machine would silently resolve every requested ID
+        # to the same physical adapter, and the caller would go on to spawn
+        # two full model workers competing for one adapter's shared memory.
+        total = cls.probe_all(binary)
+        real_indices = {gpu.index for gpu in total}
+        requested = set(physical_ids)
+
+        if not requested.issubset(real_indices):
+            available = (
+                ", ".join(
+                    f"{gpu.index} = {gpu.description}" for gpu in total
+                )
+                or "none"
+            )
+            raise RuntimeError(
+                f"{len(total)} Vulkan adapter(s) actually present "
+                f"({available}), but device ID(s) "
+                f"{sorted(requested - real_indices)} were requested and "
+                "do not correspond to a real adapter."
+            )
 
         found: list[VulkanGPU] = []
         base_env = os.environ.copy()
