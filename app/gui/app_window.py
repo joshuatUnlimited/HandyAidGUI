@@ -406,7 +406,8 @@ class AppWindowMixin:
             value = int(round(float(self.threads_var.get())))
         except (TypeError, ValueError):
             value = 1
-        return max(1, value)
+        max_threads = max(1, os.cpu_count() or 16)
+        return max(1, min(value, max_threads))
 
     def on_threads_changed(self):
         if hasattr(self, "threads_label"):
