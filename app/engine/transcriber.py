@@ -359,6 +359,54 @@ class TranscriptionEngineMixin:
                     binary,
                 )
 
+            # Verify the selected IDs correspond to distinct physical
+            # adapters before committing to multi-GPU mode. Some Vulkan
+            # ICDs silently ignore an out-of-range GGML_VK_VISIBLE_DEVICES
+            # value instead of erroring, which on a single-adapter (often
+            # UMA/iGPU) machine with a stale multi-device selection would
+            # otherwise resolve every requested ID to the same real adapter
+            # and spawn two full model workers competing for its memory —
+            # this is what previously surfaced as a huge CPU buffer
+            # allocation failure ("Balanced GPU worker failed on GPU 0").
+            try:
+                physical = VulkanGPUManager.probe_all(binary)
+            except Exception:
+                physical = []
+
+            real_indices = {gpu.index for gpu in physical}
+            distinct_ids = tuple(
+                dict.fromkeys(
+                    device_id
+                    for device_id in device_ids
+                    if device_id in real_indices
+                )
+            )
+
+            if len(distinct_ids) < 2:
+                found = (
+                    ", ".join(
+                        f"{gpu.index} = {gpu.description}"
+                        for gpu in physical
+                    )
+                    or "no Vulkan adapters"
+                )
+                self.ui_queue.put(
+                    (
+                        "log",
+                        f"Selected Vulkan device IDs {list(device_ids)} do not "
+                        f"correspond to two distinct physical adapters "
+                        f"(found: {found}); using normal single-process mode.\n",
+                    )
+                )
+                return self.run_transcription(
+                    cmd,
+                    audio_path,
+                    model_path,
+                    binary,
+                )
+
+            device_ids = distinct_ids
+
             prepared_audio, temp_audio = self.prepare_audio(audio_path)
             duration = self.get_audio_duration(prepared_audio)
             if not duration:
