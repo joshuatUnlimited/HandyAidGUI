@@ -1,4 +1,5 @@
 import json
+import os
 from pathlib import Path
 
 APP_NAME = "HandyAid"
@@ -34,8 +35,14 @@ class SettingsMixin:
                 var.set(value)
 
         threads = data.get("threads")
-        if isinstance(threads, int) and threads > 0:
+        max_threads = max(1, os.cpu_count() or 16)
+        if isinstance(threads, int) and 0 < threads <= max_threads:
             self.threads_var.set(threads)
+        elif isinstance(threads, int) and threads > max_threads:
+            # Stale/corrupted config from before the upper-bound clamp existed
+            # (or a hand-edited value). Fall back to a safe default instead of
+            # silently handing an oversized --threads value to the backend.
+            self.threads_var.set(max_threads)
 
     def save_settings(self):
         data = {
