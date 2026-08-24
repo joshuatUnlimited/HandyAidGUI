@@ -12,6 +12,26 @@ from tkinter import messagebox
 
 from app.backends.gpu_manager import VulkanGPUManager
 
+# Known signatures of an out-of-memory-style backend crash, used only to
+# make finish_job()'s failure dialog friendlier — never to change whether
+# or how a job runs. 3221225477 / -1073741819 are the unsigned/signed
+# forms of Windows exit code 0xC0000005 (access violation), which is what
+# an out-of-memory allocation failure in the backend typically surfaces
+# as on Windows.
+_OOM_EXIT_CODES = frozenset({3221225477, -1073741819})
+_OOM_LOG_PATTERNS = (
+    "failed to allocate",
+    "alloc_buffer",
+    "gallocr_reserve",
+)
+
+
+def _looks_like_oom_crash(rc, raw_output):
+    if rc in _OOM_EXIT_CODES:
+        return True
+    lowered = (raw_output or "").lower()
+    return any(pattern in lowered for pattern in _OOM_LOG_PATTERNS)
+
 
 class TranscriptionEngineMixin:
     def start_transcription(self):
@@ -122,6 +142,8 @@ class TranscriptionEngineMixin:
                     "Each GPU must independently fit the model; audio is divided by available VRAM.\n"
                 )
 
+            self._preflight_vram_check(binary, model, selected_ids)
+
         self.current_output_path = output
         self.current_audio_path = audio
         self.last_segments = []
@@ -184,6 +206,47 @@ class TranscriptionEngineMixin:
             daemon=True,
         )
         self.worker.start()
+
+    def _preflight_vram_check(self, binary, model_path, device_ids):
+        """
+        Best-effort VRAM sanity check for a normal (non-balanced) run,
+        reusing the same fits/doesn't-fit judgement
+        VulkanGPUManager.choose_workers() already makes for the balanced
+        multi-GPU path. Only the FIRST selected device is checked, since
+        that's the one a normal single-process run actually uses (see
+        command_builder.py's _vulkan_runtime_device_index()).
+
+        This is advisory only — it logs a warning and lets the run
+        proceed either way, since VRAM reporting (especially on UMA/iGPU
+        adapters) can be imprecise and transcribe-cli's own error handling
+        remains the authoritative check. It exists to turn a subset of
+        "black-box OOM crash" cases into an actionable heads-up before the
+        job even starts, not to gate normal transcription on a heuristic.
+        """
+        if not device_ids:
+            return
+
+        try:
+            model_size = Path(model_path).stat().st_size
+            gpus = VulkanGPUManager.probe(binary, device_ids[:1])
+            eligible = VulkanGPUManager.choose_workers(
+                gpus, model_size_bytes=model_size
+            )
+        except Exception as exc:
+            self.append_log(f"VRAM pre-flight check skipped ({exc}).\n")
+            return
+
+        if gpus and not eligible:
+            gpu = gpus[0]
+            self.append_log(
+                "Warning: GPU "
+                f"{gpu.index} ({gpu.description}) reports "
+                f"{gpu.free_gib:.2f} GiB free, which may not be enough "
+                f"for this model (~{model_size / (1024 ** 3):.2f} GiB on "
+                "disk). Continuing, but a low-memory failure is possible — "
+                "consider closing other GPU-heavy apps or trying a smaller "
+                "model.\n"
+            )
 
     def run_transcription(self, cmd, audio_path, model_path=None, binary=None):
         raw_output = []
@@ -925,10 +988,22 @@ class TranscriptionEngineMixin:
             if len(detail) > 3500:
                 detail = detail[-3500:]
 
+            if _looks_like_oom_crash(rc, raw_output):
+                headline = (
+                    "This looks like an out-of-memory crash, not a "
+                    "configuration error — the backend likely couldn't "
+                    "allocate enough memory for this model/GPU combination. "
+                    "Try a smaller model, single-GPU mode, or freeing up "
+                    "GPU memory before retrying.\n\n"
+                )
+            else:
+                headline = ""
+
             messagebox.showerror(
                 "Transcription Failed",
                 (
                     f"The transcriber exited with code {rc}.\n\n"
+                    f"{headline}"
                     "Backend diagnostics:\n"
                     f"{detail}\n\n"
                     "The full diagnostics remain in Process Log."
