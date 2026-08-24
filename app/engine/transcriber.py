@@ -64,6 +64,7 @@ class TranscriptionEngineMixin:
             return
 
         self.append_log("\n--- Backend preflight ---\n")
+        self.append_log(f"CPU threads requested: {self.resolved_threads()}\n")
         help_text = self.probe_backend_help(binary)
         if help_text and help_text.lower().startswith("unable to query"):
             self.append_log(help_text + "\n")
