@@ -2,6 +2,8 @@ import json
 import os
 from pathlib import Path
 
+from app.backends.gpu_manager import VulkanGPUManager
+
 APP_NAME = "HandyAid"
 APP_SUBTITLE = "Offline transcription workstation — any GGUF model"
 CONFIG_FILE = Path.home() / ".moss_handy_transcriber.json"
@@ -28,11 +30,29 @@ class SettingsMixin:
             ("timestamps", self.timestamp_var),
             ("speaker_mode", self.speaker_mode_var),
             ("backend", self.backend_var),
-            ("vulkan_devices", self.vulkan_devices_var),
         ]:
             value = data.get(key)
             if value is not None:
                 var.set(value)
+
+        # vulkan_devices gets format-only validation here (pure parsing,
+        # no hardware probe — settings load must stay cheap and
+        # dependency-free). Whether the IDs correspond to real, currently
+        # present adapters is re-checked against actual hardware right
+        # before a transcription starts (see transcriber.py), and the GPU
+        # panel (gpu_panel.py, when wired up via gpu_manager.GPUManager)
+        # populates this field from real hardware in the first place —
+        # this is just a backstop against a hand-edited or otherwise
+        # malformed config value crashing settings load or silently
+        # carrying garbage forward.
+        vulkan_devices = data.get("vulkan_devices")
+        if isinstance(vulkan_devices, str):
+            try:
+                VulkanGPUManager.parse_ids(vulkan_devices)
+            except ValueError:
+                pass  # malformed (e.g. hand-edited); leave the field at its default
+            else:
+                self.vulkan_devices_var.set(vulkan_devices)
 
         threads = data.get("threads")
         max_threads = max(1, os.cpu_count() or 16)
