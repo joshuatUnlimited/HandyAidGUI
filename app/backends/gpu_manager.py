@@ -2,6 +2,7 @@ import os
 import re
 import subprocess
 from dataclasses import dataclass
+from types import SimpleNamespace
 
 
 @dataclass(frozen=True)
@@ -409,3 +410,57 @@ class VulkanGPUManager:
             )
 
         return "\n".join(lines)
+
+
+def _as_panel_info(gpu: VulkanGPU):
+    """
+    Adapt a VulkanGPU to the plain (.index, .name, .vram_total, .vram_free)
+    shape app/gui/gpu_panel.py's GPUInfo expects. Duck-typed on purpose —
+    gpu_panel.py owns its own GPUInfo dataclass and never imports this
+    module, so gpu_manager.py stays free of any GUI dependency.
+    """
+    return SimpleNamespace(
+        index=gpu.index,
+        name=gpu.description,
+        vram_total=gpu.memory_total,
+        vram_free=gpu.memory_free,
+    )
+
+
+class GPUManager:
+    """
+    Adapter exposing the interface app/gui/gpu_panel.py's
+    GPUControlPanelMixin expects from `self.gpu_manager`:
+
+        enumerate_all(binary) -> list[GPUInfo]   full rescan
+        probe(binary, index)  -> GPUInfo         cheap single-device refresh
+
+    This exists so the GPU control panel is always populated from real,
+    currently-detected Vulkan adapters rather than a free-text device-ID
+    setting the user (or a stale config file) could set to anything —
+    which was the actual root cause of the "Balanced GPU worker failed"
+    crash this class was added to prevent from recurring.
+
+    Wire it in the main window class before calling build_gpu_tab():
+
+        from app.backends.gpu_manager import GPUManager
+        self.gpu_manager = GPUManager()
+        self.transcribe_binary = <path to transcribe-cli>
+    """
+
+    @staticmethod
+    def enumerate_all(binary: str):
+        return [
+            _as_panel_info(gpu)
+            for gpu in VulkanGPUManager.probe_all(binary)
+        ]
+
+    @staticmethod
+    def probe(binary: str, index: int):
+        matches = VulkanGPUManager.probe(binary, (index,))
+        if not matches:
+            raise RuntimeError(
+                f"Vulkan adapter {index} did not respond to a re-probe "
+                "(it may have been disconnected or reset)."
+            )
+        return _as_panel_info(matches[0])
